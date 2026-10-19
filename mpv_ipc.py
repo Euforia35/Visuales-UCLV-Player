@@ -122,6 +122,11 @@ class MpvIPCPlayer:
         args.append(url)
 
         self.last_error = ""
+        # Al empezar un archivo nuevo, los valores cacheados del anterior
+        # no deben usarse para guardar progreso ni pintar la barra.
+        with self._props_lock:
+            self._properties["time-pos"] = 0.0
+            self._properties["duration"] = 0.0
         # Volcamos stderr a un ARCHIVO, no a un PIPE: un pipe que nadie
         # lee continuamente se llena y hace que el proceso hijo se
         # quede colgado esperando poder escribir (deadlock clásico de
@@ -165,13 +170,26 @@ class MpvIPCPlayer:
                 self.last_error = "mpv no respondió a tiempo (timeout esperando el socket de control)."
             return False
 
-        self._connect()
+        if not self._connect():
+            # mpv abrió la ventana pero no pudimos hablarle por el socket:
+            # sin IPC los controles de la app no sirven, así que lo damos
+            # por fallido (y reintentamos sin flags extra si corresponde).
+            self.last_error = (
+                "mpv arrancó pero no se pudo conectar al socket de control "
+                f"({self.socket_path})."
+            )
+            self.terminate()
+            if not _retry_minimal:
+                return self.start(url, title=title, audio_only=audio_only, _retry_minimal=True)
+            return False
+
         self.observe("time-pos")
         self.observe("duration")
         self.observe("playlist-pos")
         self.observe("playlist-count")
         self.observe("eof-reached")
         self.observe("path")
+        self.observe("pause")
         self._cleanup_stderr_log()
         return True
 
@@ -197,6 +215,9 @@ class MpvIPCPlayer:
         self.command(["loadfile", url, "replace"])
         self.set_property("title", title or "Visuales UCLV")
         self.set_property("pause", False)
+        with self._props_lock:
+            self._properties["time-pos"] = 0.0
+            self._properties["duration"] = 0.0
 
     # ------------------------------------------------------------------
     # Cola de reproducción (playlist nativa de mpv)
@@ -245,18 +266,20 @@ class MpvIPCPlayer:
             time.sleep(0.1)
         return False
 
-    def _connect(self):
+    def _connect(self) -> bool:
         try:
             self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self._sock.settimeout(5.0)
             self._sock.connect(self.socket_path)
             self._sock.settimeout(None)
-        except Exception:
+        except Exception as exc:
             self._sock = None
-            return
+            self.last_error = str(exc)
+            return False
         self._stop_reading.clear()
         self._reader_thread = threading.Thread(target=self._read_loop, daemon=True)
         self._reader_thread.start()
+        return True
 
     def _read_loop(self):
         buf = b""

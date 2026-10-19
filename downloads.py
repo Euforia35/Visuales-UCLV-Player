@@ -64,6 +64,17 @@ class DownloadManager(QObject):
         if task:
             task.cancel_event.set()
 
+    def cancel_all(self):
+        for task in self.tasks.values():
+            if task.status in ("queued", "downloading"):
+                task.cancel_event.set()
+
+    def shutdown(self):
+        """Cancela lo pendiente y libera el pool sin esperar a que una
+        descarga de red lenta retrase el cierre de la app."""
+        self.cancel_all()
+        self.executor.shutdown(wait=False, cancel_futures=True)
+
     def open_folder_path(self) -> Path:
         return self.dest_dir
 
@@ -123,4 +134,8 @@ class DownloadManager(QObject):
         except Exception as exc:
             task.status = "error"
             task.error_message = str(exc)
+            try:
+                part_path.unlink(missing_ok=True)
+            except OSError:
+                pass
             self.status_changed.emit(task_id, f"error:{exc}")

@@ -32,7 +32,7 @@ from thumbnails import (
 )
 from downloads import DownloadManager
 from movie_detail import MovieDetailView
-from music_view import MusicAlbumView, MusicPlayerBar, LyricsDialog
+from music_view import MusicAlbumView, MusicPlayerBar, LyricsDialog, ALBUM_COVER_SIZE
 from audio_metadata import AudioMetadataManager
 from lyrics import fetch_lyrics
 from config_store import ConfigStore
@@ -154,11 +154,12 @@ def _make_placeholder(entry: Entry) -> QPixmap:
 class MainWindow(QMainWindow):
     # Señales propias para recibir resultados de trabajo en segundo plano
     # (ver la nota más arriba sobre por qué no se usa QThread para esto).
-    _listing_ready_signal = Signal(object, bool)  # (DirListing, push_history)
-    _synopsis_ready_signal = Signal(str, str)      # (texto, error)
+    _listing_ready_signal = Signal(object, bool, int)  # (DirListing, push_history, request_id)
+    _synopsis_ready_signal = Signal(str, str, int)  # (texto, error, request_id)
     _lyrics_ready_signal = Signal(str, str)        # (letra, error)
-    _imdb_ready_signal = Signal(str, str, str)     # (sinopsis, url_poster, error)
+    _imdb_ready_signal = Signal(str, str, str, int)     # (sinopsis, url_poster, error, request_id)
     _folder_scan_ready_signal = Signal(list, str, float)  # (archivos, nombre_raiz, bytes_totales)
+    _add_subtitle_signal = Signal(str, str, bool)  # (url_video, url_subtitulo, seleccionar)
 
     def __init__(self):
         super().__init__()
@@ -178,6 +179,12 @@ class MainWindow(QMainWindow):
         self._grid_items: dict[str, QListWidgetItem] = {}
         self.view_mode = "list"  # "list" | "grid"
         self._io_executor = ThreadPoolExecutor(max_workers=4)
+        # IDs para descartar respuestas viejas que llegan tarde (el usuario
+        # ya navegó a otra carpeta o ya se mostró otra sinopsis).
+        self._listing_request_id = 0
+        self._synopsis_request_id = 0
+        self._imdb_request_id = 0
+        self._music_cover_set = False
 
         self._listing_ready_signal.connect(self._on_listing_ready)
         self._synopsis_ready_signal.connect(self._on_synopsis_ready)
@@ -185,6 +192,7 @@ class MainWindow(QMainWindow):
         self._active_lyrics_dialog = None
         self._imdb_ready_signal.connect(self._on_imdb_ready)
         self._folder_scan_ready_signal.connect(self._on_folder_scan_ready)
+        self._add_subtitle_signal.connect(self._on_history_subtitle_ready)
 
         APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
         self.favorites = self._load_favorites()
@@ -399,28 +407,36 @@ class MainWindow(QMainWindow):
     # Navegación
     # ------------------------------------------------------------------
     def navigate_to(self, url: str, push_history: bool, force: bool = False):
+        self._listing_request_id += 1
+        request_id = self._listing_request_id
         self.status_label.setText("Cargando…")
         self.file_list.clear()
         self._grid_items.clear()
         try:
-            self._io_executor.submit(self._fetch_listing_bg, url, force, push_history)
+            self._io_executor.submit(self._fetch_listing_bg, url, force, push_history, request_id)
         except RuntimeError:
             pass  # la app se está cerrando; ignoramos trabajo nuevo
 
-    def _fetch_listing_bg(self, url: str, force: bool, push_history: bool):
+    def _fetch_listing_bg(self, url: str, force: bool, push_history: bool, request_id: int):
         """Corre en un hilo del executor. Emitir la señal acá (desde un
         hilo que no es el principal) es seguro: Qt encola automáticamente
         la entrega al slot conectado en el hilo principal."""
         listing = self.client.list_dir(url, force=force)
-        self._listing_ready_signal.emit(listing, push_history)
+        self._listing_ready_signal.emit(listing, push_history, request_id)
 
-    def _on_listing_ready(self, listing: DirListing, push_history: bool):
+    def _on_listing_ready(self, listing: DirListing, push_history: bool, request_id: int = -1):
+        if request_id != -1 and request_id != self._listing_request_id:
+            return  # respuesta vieja: el usuario ya pidió otra carpeta
         if listing.error:
             self.status_label.setText(friendly_error(listing.error))
             self.file_list.clear()
+            self.current_entries = []
+            self.current_url = listing.url
+            self._grid_items.clear()
             retry_item = QListWidgetItem("⟳  Tocá para reintentar")
             retry_item.setData(Qt.UserRole, None)
             self.file_list.addItem(retry_item)
+            self.stack.setCurrentWidget(self.file_list)
             self._pending_retry_url = listing.url
             return
 
@@ -496,6 +512,8 @@ class MainWindow(QMainWindow):
 
         self._detail_media_type = self._media_type_for_folder(folder_url)
         self.detail_view.reset(title or "Sin título")
+        # una búsqueda de TMDb de la carpeta anterior ya no aplica acá
+        self._imdb_request_id += 1
         size_bits = [e.size for e in video_entries if e.size]
         meta_parts = [f"{len(video_entries)} archivo(s) de video"]
         if len(video_entries) == 1 and video_entries[0].size:
@@ -512,6 +530,8 @@ class MainWindow(QMainWindow):
         if sinopsis_entry:
             self._fetch_synopsis(sinopsis_entry.url)
         else:
+            # invalida cualquier sinopsis anterior que todavía esté en vuelo
+            self._synopsis_request_id += 1
             self.detail_view.set_synopsis("")
 
         # Carátula (heurística de imágenes dentro de la carpeta)
@@ -519,16 +539,20 @@ class MainWindow(QMainWindow):
         self.thumbnails.request(self._detail_poster_key, in_folder_poster_candidates(entries))
 
     def _fetch_synopsis(self, url: str):
+        self._synopsis_request_id += 1
+        request_id = self._synopsis_request_id
         try:
-            self._io_executor.submit(self._fetch_synopsis_bg, url)
+            self._io_executor.submit(self._fetch_synopsis_bg, url, request_id)
         except RuntimeError:
             pass  # la app se está cerrando; ignoramos trabajo nuevo
 
-    def _fetch_synopsis_bg(self, url: str):
+    def _fetch_synopsis_bg(self, url: str, request_id: int):
         text, error = _fetch_text_bg(self.client.session, url)
-        self._synopsis_ready_signal.emit(text, error)
+        self._synopsis_ready_signal.emit(text, error, request_id)
 
-    def _on_synopsis_ready(self, text: str, error: str):
+    def _on_synopsis_ready(self, text: str, error: str, request_id: int = -1):
+        if request_id != -1 and request_id != self._synopsis_request_id:
+            return  # llegó tarde: ya se está mostrando otra carpeta
         self.detail_view.set_synopsis(text if not error else "")
 
     def _on_detail_play_requested(self, url: str, name: str):
@@ -549,6 +573,7 @@ class MainWindow(QMainWindow):
         )
         self.music_view.load(entries, title or "Sin título")
         self.stack.setCurrentWidget(self.music_view)
+        self._music_cover_set = False
 
         # Carátula de la carpeta como respaldo inmediato mientras llegan
         # las carátulas embebidas de cada track.
@@ -564,18 +589,22 @@ class MainWindow(QMainWindow):
     def _on_track_metadata_ready(self, url: str, track):
         self.music_view.update_track_meta(url, track)
         # si la carpeta no tenía una carátula suelta, usamos la primera
-        # carátula embebida que llegue como carátula del álbum
-        if track.cover_bytes and self.stack.currentWidget() is self.music_view:
-            current_cover = self.music_view.cover_label.pixmap()
-            if current_cover is None or current_cover.isNull():
-                pix = QPixmap()
-                if pix.loadFromData(track.cover_bytes):
-                    size = self.music_view.cover_label.size()
-                    scaled = pix.scaled(
-                        size.width(), size.height(),
-                        Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation,
-                    )
-                    self.music_view.set_cover_pixmap(scaled)
+        # carátula embebida que llegue como carátula del álbum. Ojo: el
+        # QLabel arranca con un placeholder no nulo, así que "está vacío"
+        # no sirve como condición — usamos una bandera explícita.
+        if (
+            track.cover_bytes
+            and self.stack.currentWidget() is self.music_view
+            and not self._music_cover_set
+        ):
+            pix = QPixmap()
+            if pix.loadFromData(track.cover_bytes):
+                scaled = pix.scaled(
+                    ALBUM_COVER_SIZE[0], ALBUM_COVER_SIZE[1],
+                    Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation,
+                )
+                self.music_view.set_cover_pixmap(scaled)
+                self._music_cover_set = True
 
     def _on_music_play_requested(self, tracks: list, start_index: int, shuffle: bool):
         self.music_bar.play_queue(tracks, start_index=start_index, shuffle=shuffle)
@@ -638,16 +667,22 @@ class MainWindow(QMainWindow):
 
         tipo = "serie" if self._detail_media_type == "tv" else "película"
         self.detail_view.set_synopsis(f"Buscando \"{clean_title}\" ({tipo}) en TMDb (en español)…")
+        self._imdb_request_id += 1
         try:
-            self._io_executor.submit(self._fetch_imdb_bg, api_key, clean_title, year, self._detail_media_type)
+            self._io_executor.submit(
+                self._fetch_imdb_bg, api_key, clean_title, year,
+                self._detail_media_type, self._imdb_request_id,
+            )
         except RuntimeError:
             pass
 
-    def _fetch_imdb_bg(self, api_key: str, title: str, year: str | None, media_type: str):
+    def _fetch_imdb_bg(self, api_key: str, title: str, year: str | None, media_type: str, request_id: int):
         plot, poster_url, error = tmdb.fetch_synopsis(api_key, title, year, language="es-ES", media_type=media_type)
-        self._imdb_ready_signal.emit(plot, poster_url or "", error)
+        self._imdb_ready_signal.emit(plot, poster_url or "", error, request_id)
 
-    def _on_imdb_ready(self, plot: str, poster_url: str, error: str):
+    def _on_imdb_ready(self, plot: str, poster_url: str, error: str, request_id: int = -1):
+        if request_id != -1 and request_id != self._imdb_request_id:
+            return
         if self.stack.currentWidget() is not self.detail_view:
             return
         if error:
@@ -714,12 +749,12 @@ class MainWindow(QMainWindow):
             return
         self._indexing_in_progress = True
         try:
-            self._io_executor.submit(self._build_catalog_bg)
+            self._io_executor.submit(self._build_catalog_bg, force)
         except RuntimeError:
             self._indexing_in_progress = False
 
-    def _build_catalog_bg(self):
-        self.catalog.build(BASE_URL, root_label="Inicio")
+    def _build_catalog_bg(self, force: bool):
+        self.catalog.build(BASE_URL, root_label="Inicio", force=force)
 
     def _on_catalog_progress(self, count: int, path: str):
         self._indexing_in_progress = True
@@ -780,14 +815,32 @@ class MainWindow(QMainWindow):
             self.thumbnails.request(video_url + "#historycover", candidates)
 
     def _on_history_play_requested(self, video_url: str, title: str, position: float):
+        # No hacer red acá: esto corre en el hilo de la GUI y un listado
+        # lento congelaría toda la ventana. Buscamos los subtítulos en
+        # segundo plano y arrancamos la reproducción de inmediato.
+        self._open_player(video_url, title, start_at=position, subtitle_urls=[])
+        try:
+            self._io_executor.submit(self._load_history_subs_bg, video_url)
+        except RuntimeError:
+            pass
+
+    def _load_history_subs_bg(self, video_url: str):
         folder_url = video_url.rsplit("/", 1)[0] + "/"
-        listing = self.client.list_dir(folder_url)  # normalmente cacheado (ver arriba)
-        subs = []
-        if not listing.error:
-            entry = next((e for e in listing.entries if e.url == video_url), None)
-            if entry:
-                subs = subtitle_urls_for(entry, listing.entries)
-        self._open_player(video_url, title, start_at=position, subtitle_urls=subs)
+        listing = self.client.list_dir(folder_url)
+        if listing.error:
+            return
+        entry = next((e for e in listing.entries if e.url == video_url), None)
+        if not entry:
+            return
+        for i, sub_url in enumerate(subtitle_urls_for(entry, listing.entries)):
+            # el player ya puede haberse cerrado o cambiado de video;
+            # seleccionamos solo el primero (mismo criterio que antes).
+            self._add_subtitle_signal.emit(video_url, sub_url, i == 0)
+
+    def _on_history_subtitle_ready(self, video_url: str, subtitle_url: str, select: bool):
+        if self.player.current_url != video_url:
+            return  # el usuario ya cambió de video
+        self.player.add_subtitle_url(subtitle_url, select=select)
 
     def _on_history_remove_requested(self, video_url: str):
         self.progress.remove(video_url)
@@ -890,6 +943,19 @@ class MainWindow(QMainWindow):
                 self.history_view.set_cover(key[: -len("#historycover")], scaled)
             return
 
+        # ¿Es la carátula de la carpeta de música abierta?
+        if key.endswith("#musiccover"):
+            if self.stack.currentWidget() is self.music_view:
+                pix = QPixmap()
+                if pix.loadFromData(data):
+                    scaled = pix.scaled(
+                        ALBUM_COVER_SIZE[0], ALBUM_COVER_SIZE[1],
+                        Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation,
+                    )
+                    self.music_view.set_cover_pixmap(scaled)
+                    self._music_cover_set = True
+            return
+
         item = self._grid_items.get(key)
         if not item:
             return  # el usuario navegó a otra carpeta antes de que llegara
@@ -954,8 +1020,11 @@ class MainWindow(QMainWindow):
         item = self.file_list.itemAt(pos)
         if not item:
             return
-        entry: Entry = item.data(Qt.UserRole)
+        entry: Entry | None = item.data(Qt.UserRole)
         menu = QMenu(self)
+
+        if entry is None:
+            return  # ítem especial de "reintentar": no tiene acciones de archivo
 
         if entry.is_dir:
             menu.addAction("Abrir carpeta", lambda: self.navigate_to(entry.url, push_history=True))
@@ -1222,5 +1291,9 @@ class MainWindow(QMainWindow):
         self._save_current_progress()
         self.player.shutdown()
         self.music_bar.shutdown()
+        self.catalog.cancel()
+        self.downloads.shutdown()
+        self.thumbnails.shutdown()
+        self.audio_metadata.shutdown()
         self._io_executor.shutdown(wait=False, cancel_futures=True)
         super().closeEvent(event)

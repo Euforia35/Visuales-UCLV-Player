@@ -37,6 +37,7 @@ class PlayerWidget(QWidget):
     error_occurred = Signal(str)
     track_finished = Signal()  # el video llegó al final de verdad (no pausa)
     online_subtitles_requested = Signal()
+    _pause_state_signal = Signal(bool)  # puente hilo IPC -> hilo GUI
 
     IDLE_TEXT = (
         "🎬 El video se abre en una ventana aparte de mpv.\n"
@@ -54,8 +55,10 @@ class PlayerWidget(QWidget):
         self._pending_start_at = 0.0
         self._paused = False
         self._eof_callback_registered = False
+        self._seek_callback_registered = False
 
         self._build_ui()
+        self._pause_state_signal.connect(self._on_pause_changed)
 
         if not MPV_AVAILABLE:
             self.info_label.setText(
@@ -165,6 +168,7 @@ class PlayerWidget(QWidget):
             return False
         self._mpv = MpvIPCPlayer()
         self._eof_callback_registered = False
+        self._seek_callback_registered = False
         return True
 
     # ------------------------------------------------------------------
@@ -176,6 +180,7 @@ class PlayerWidget(QWidget):
         self.info_label.setText(f"🎬 Reproduciendo en la ventana de mpv:\n{self._current_title}")
         self._paused = False
         self.play_btn.setText("⏸")
+        self._pending_start_at = 0.0
 
         already_running = self._mpv.is_running()
         if already_running:
@@ -195,6 +200,7 @@ class PlayerWidget(QWidget):
             # proceso de mpv, no en cada video, para no acumular
             # callbacks duplicados al pasar de un video a otro).
             self._mpv.on_property("eof-reached", self._on_eof_reached)
+            self._mpv.on_property("pause", self._pause_state_signal.emit)
             # "end-file" con reason="error" es como mpv avisa que un
             # archivo puntual falló al cargar DESPUÉS de que el proceso
             # ya arrancó bien (ej. timeout de red con el servidor) — a
@@ -210,6 +216,14 @@ class PlayerWidget(QWidget):
         if start_at and start_at > 1:
             self._pending_start_at = start_at
             self._arm_resume_seek()
+
+    def _on_pause_changed(self, value):
+        # Si el usuario pausa/reanuda desde la propia ventana de mpv, el
+        # botón de la app tiene que reflejarlo (antes solo cambiaba al
+        # usar el botón de acá).
+        paused = bool(value)
+        self._paused = paused
+        self.play_btn.setText("▶" if paused else "⏸")
 
     def _on_end_file(self, msg: dict):
         # Corre en el hilo lector del socket IPC (no el de la GUI);
@@ -231,12 +245,23 @@ class PlayerWidget(QWidget):
             self.track_finished.emit()
 
     def _arm_resume_seek(self):
-        def _on_seekable(value):
-            if value and self._pending_start_at:
+        if self._seek_callback_registered:
+            # El callback es uno solo por proceso de mpv y lee siempre el
+            # valor pendiente actual; registrar uno nuevo por cada video
+            # acumulaba callbacks y podía saltar a una posición vieja.
+            return
+
+        def _apply_pending_seek(*_args):
+            if self._pending_start_at and self._mpv and self._mpv.is_running():
                 self._mpv.seek(self._pending_start_at, absolute=True)
                 self._pending_start_at = 0.0
 
-        self._mpv.on_property("seekable", _on_seekable)
+        # "seekable" puede no volver a emitirse si mpv ya estaba en True
+        # al cargar el siguiente archivo; "file-loaded" garantiza el
+        # salto de resume en cada video nuevo.
+        self._mpv.on_property("seekable", _apply_pending_seek)
+        self._mpv.on_event("file-loaded", _apply_pending_seek)
+        self._seek_callback_registered = True
 
     def current_progress(self) -> tuple[float, float]:
         if not self._mpv or not self._mpv.is_running():
@@ -248,7 +273,7 @@ class PlayerWidget(QWidget):
     def toggle_pause(self):
         if not self._mpv or not self._mpv.is_running():
             return
-        self._paused = not self._paused
+        self._paused = not bool(self._mpv.get_cached_property("pause", self._paused))
         self._mpv.play_pause(self._paused)
         self.play_btn.setText("▶" if self._paused else "⏸")
 
@@ -265,6 +290,8 @@ class PlayerWidget(QWidget):
         self._pending_start_at = 0.0
         self._paused = False
         self.play_btn.setText("⏸")
+        self._eof_callback_registered = False
+        self._seek_callback_registered = False
 
     def seek_relative(self, seconds: float):
         if self._mpv and self._mpv.is_running():
@@ -280,6 +307,17 @@ class PlayerWidget(QWidget):
             self._mpv.add_subtitle(path, select=True)
             self.sub_btn.setChecked(True)
             self._mpv.set_sub_visibility(True)
+
+    def add_subtitle_url(self, url: str, select: bool = True):
+        """Agrega un subtítulo remoto (misma carpeta del video) sin
+        interrumpir la reproducción. Con varios subtítulos conviene
+        select=True solo en el primero, para no terminar seleccionando
+        el último de la lista de forma arbitraria."""
+        if self._mpv and self._mpv.is_running():
+            self._mpv.add_subtitle(url, select=select)
+            if select:
+                self.sub_btn.setChecked(True)
+                self._mpv.set_sub_visibility(True)
 
     def current_title(self) -> str:
         return self._current_title

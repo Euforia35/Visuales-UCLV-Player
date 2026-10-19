@@ -300,7 +300,7 @@ class MusicPlayerBar(QWidget):
     def toggle_pause(self):
         if not self._mpv or not self._mpv.is_running():
             return
-        current = self._mpv.get_cached_property("pause", False)
+        current = bool(self._mpv.get_cached_property("pause", False))
         new_val = not current
         self._mpv.set_property("pause", new_val)
         self.play_btn.setText("▶" if new_val else "⏸")

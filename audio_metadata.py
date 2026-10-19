@@ -117,6 +117,9 @@ class AudioMetadataManager(QObject):
         self._inflight.add(url)
         self.executor.submit(self._fetch, entry)
 
+    def shutdown(self):
+        self.executor.shutdown(wait=False, cancel_futures=True)
+
     def get_cached(self, url: str) -> Track | None:
         return self._cache.get(url)
 

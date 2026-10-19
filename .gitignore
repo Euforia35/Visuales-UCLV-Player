@@ -1,0 +1,16 @@
+# Entornos virtuales (los crea run.sh / build_dmg.sh)
+venv/
+.venv-test/
+
+# Cachés de Python
+__pycache__/
+*.py[cod]
+
+# Artefactos de empaquetado (build_app.sh / build_dmg.sh / py2app)
+build/
+dist/
+*.app/
+*.dmg
+
+# macOS
+.DS_Store

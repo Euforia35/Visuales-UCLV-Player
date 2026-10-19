@@ -157,33 +157,50 @@ class ThumbnailManager(QObject):
         self._done: set[str] = set()
 
     def request(self, key: str, candidates: list[str]):
-        if key in self._inflight or key in self._done:
+        if key in self._inflight:
             return
+        if key in self._done:
+            # Ya se descargó antes (ej. el usuario volvió a esta carpeta o
+            # refrescó el listado): reemitimos desde la caché en disco en
+            # vez de dejar el placeholder para siempre.
+            cached = self._read_cache(key)
+            if cached is not None:
+                self.thumbnail_ready.emit(key, cached)
+                return
+            self._done.discard(key)
         if not candidates:
             self.thumbnail_missing.emit(key)
             return
         self._inflight.add(key)
         self.executor.submit(self._fetch, key, candidates)
 
+    def shutdown(self):
+        self.executor.shutdown(wait=False, cancel_futures=True)
+
     def _cache_path(self, key: str) -> Path:
         digest = hashlib.sha1(key.encode("utf-8")).hexdigest()
         return self.cache_dir / f"{digest}.img"
 
-    def _fetch(self, key: str, candidates: list[str]):
+    def _read_cache(self, key: str) -> bytes | None:
+        cache_path = self._cache_path(key)
         try:
-            cache_path = self._cache_path(key)
             if cache_path.exists() and cache_path.stat().st_size > 0:
                 cached = cache_path.read_bytes()
                 if _looks_like_real_image(cached):
-                    self.thumbnail_ready.emit(key, cached)
-                    self._done.add(key)
-                    return
-                # caché corrupta de una versión anterior sin esta validación:
-                # la descartamos y probamos de nuevo desde los candidatos
-                try:
-                    cache_path.unlink()
-                except OSError:
-                    pass
+                    return cached
+                cache_path.unlink()
+        except OSError:
+            pass
+        return None
+
+    def _fetch(self, key: str, candidates: list[str]):
+        try:
+            cache_path = self._cache_path(key)
+            cached = self._read_cache(key)
+            if cached is not None:
+                self.thumbnail_ready.emit(key, cached)
+                self._done.add(key)
+                return
 
             for url in candidates:
                 try:

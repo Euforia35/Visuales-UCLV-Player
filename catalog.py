@@ -84,23 +84,33 @@ class SiteCatalog(QObject):
             pass
 
     # ------------------------------------------------------------------
-    def build(self, root_url: str, root_label: str = "Inicio"):
+    def build(self, root_url: str, root_label: str = "Inicio", force: bool = False):
         """Recorre el árbol completo. Pensado para correr en un hilo de
-        fondo — emite `progress` de a poco y `finished` al terminar."""
+        fondo — emite `progress` de a poco y `finished` al terminar.
+
+        force=True ignora la caché en memoria del cliente (lo usa el
+        botón "Reindexar": sin esto, dentro de los 2 minutos de TTL se
+        reindexaba con listados viejos y el contenido nuevo no aparecía).
+        """
         self.entries = []
         self._cancel = False
-        self._walk(root_url, root_label, depth=0)
-        self.built_at = time.time()
-        self._save_to_disk()
-        self.finished.emit(len(self.entries))
+        try:
+            self._walk(root_url, root_label, depth=0, force=force)
+            self.built_at = time.time()
+            self._save_to_disk()
+        finally:
+            # Pase lo que pase, la UI tiene que salir del estado
+            # "Indexando…" (antes, una excepción acá dejaba el diálogo
+            # bloqueado para siempre).
+            self.finished.emit(len(self.entries))
 
     def cancel(self):
         self._cancel = True
 
-    def _walk(self, url: str, path_label: str, depth: int):
+    def _walk(self, url: str, path_label: str, depth: int, force: bool = False):
         if self._cancel or depth > self.max_depth or len(self.entries) >= MAX_ENTRIES:
             return
-        listing = self.client.list_dir(url, force=False)
+        listing = self.client.list_dir(url, force=force)
         if listing.error:
             return
         for entry in listing.entries:
@@ -112,7 +122,7 @@ class SiteCatalog(QObject):
             if len(self.entries) % 20 == 0:
                 self.progress.emit(len(self.entries), path_label)
             if entry.is_dir:
-                self._walk(entry.url, f"{path_label} › {entry.name}", depth + 1)
+                self._walk(entry.url, f"{path_label} › {entry.name}", depth + 1, force=force)
         self.progress.emit(len(self.entries), path_label)
 
     # ------------------------------------------------------------------
