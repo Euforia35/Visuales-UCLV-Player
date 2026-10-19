@@ -21,7 +21,7 @@ OPTIONS = {
         "apache_index", "player", "main_window", "progress", "thumbnails",
         "downloads", "mpv_ipc", "movie_detail", "music_view", "audio_metadata",
         "lyrics", "config_store", "opensubtitles", "tmdb", "online_dialogs",
-        "history_view", "catalog", "search_dialog",
+        "history_view", "catalog", "search_dialog", "local_subs_dialog",
     ],
     "resources": ["style.qss"],
     "plist": {

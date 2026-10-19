@@ -1,98 +1,108 @@
 """
 local_subs_dialog.py
 --------------------
-Diálogo para elegir uno o más subtítulos locales presentes en la misma
-carpeta que el video que se va a reproducir.
+Pop-up para escoger subtítulos locales que están en la misma carpeta que
+el video que se va a reproducir.
+
+Útil cuando los nombres no coinciden y la carga automática no los empareja:
+el diálogo lista TODOS los archivos de subtítulo de la carpeta y deja al
+usuario marcar cuáles cargar.
 """
+
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog,
-    QVBoxLayout,
-    QHBoxLayout,
-    QLabel,
-    QListWidget,
-    QListWidgetItem,
-    QPushButton,
-    QCheckBox,
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+    QListWidget, QListWidgetItem, QPushButton,
 )
 
 
 class LocalSubsDialog(QDialog):
-    """Permite al usuario elegir qué subtítulos locales cargar."""
+    """Lista los subtítulos de la carpeta y deja elegir cuáles cargar.
 
-    subs_selected = Signal(list)  # lista de URLs seleccionadas
+    Cierre:
+      - "Cargar seleccionados" -> chosen = URLs marcadas.
+      - "Reproducir sin subtítulos" -> chosen = [].
+      - "Cancelar"/cerrar -> chosen = None (el llamador aplica su
+        comportamiento por defecto, ej. los subtítulos automáticos).
+    """
 
-    def __init__(self, video_name: str, subs: list[dict], parent=None):
+    def __init__(
+        self,
+        video_name: str,
+        subs: list[dict],          # [{"url": str, "name": str}, ...]
+        preselect: list[str] | None = None,  # URLs a marcar por defecto
+        parent=None,
+    ):
         super().__init__(parent)
-        self.setWindowTitle("Seleccionar subtítulos locales")
-        self.resize(480, 360)
-        self._subs = subs
+        self.setWindowTitle("Elegir subtítulos de la carpeta")
+        self.resize(520, 400)
+        self._chosen: list[str] | None = None
+
+        preselect_set = set(preselect or [])
 
         layout = QVBoxLayout(self)
 
-        label = QLabel(
-            f"Hay {len(subs)} archivo(s) de subtítulo en la misma carpeta de:\n"
-            f"“{video_name}”\n\n"
-            "Marcá los que querés cargar (se activará el primero marcado)."
+        header = QLabel(
+            f"Video: <b>{video_name}</b><br>"
+            f"Se encontraron {len(subs)} archivo(s) de subtítulo en la misma carpeta. "
+            "Marcá el o los que quieras usar (el primero marcado será el que se muestre)."
         )
-        label.setWordWrap(True)
-        layout.addWidget(label)
+        header.setWordWrap(True)
+        layout.addWidget(header)
 
         self.list_widget = QListWidget()
         for s in subs:
             item = QListWidgetItem(s["name"])
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-            item.setCheckState(Qt.Unchecked)
+            item.setCheckState(
+                Qt.Checked if s["url"] in preselect_set else Qt.Unchecked
+            )
             item.setData(Qt.UserRole, s["url"])
             self.list_widget.addItem(item)
         layout.addWidget(self.list_widget, stretch=1)
 
-        # Pre-seleccionar los que probablemente coincidan con el video
-        # (heurística simple: nombre base contiene parte del video base)
-        try:
-            video_base = video_name.rsplit(".", 1)[0].lower()
-            for i in range(self.list_widget.count()):
-                item = self.list_widget.item(i)
-                sub_name = item.text().lower()
-                sub_base = sub_name.rsplit(".", 1)[0]
-                if video_base in sub_base or sub_base in video_base:
-                    item.setCheckState(Qt.Checked)
-        except Exception:
-            pass
+        if not subs:
+            self.list_widget.addItem(QListWidgetItem("(sin archivos de subtítulo)"))
 
-        if self.list_widget.count() > 0:
-            first = self.list_widget.item(0)
-            if first.checkState() == Qt.Unchecked:
-                # si nada coincidió, marcamos el primero por comodidad?
-                # pero mejor no imponer; dejamos todo sin marcar y que elija
-                pass
+        hint = QLabel(
+            "Tip: si el subtítulo elegido no sincroniza, probá con otro de la lista "
+            "o buscá uno online con el botón 🌐 del reproductor."
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("statusLabel")
+        layout.addWidget(hint)
 
         btn_row = QHBoxLayout()
-        self.none_btn = QPushButton("No cargar ninguno")
-        self.none_btn.clicked.connect(self._on_none)
-        self.load_btn = QPushButton("Cargar seleccionados")
-        self.load_btn.setObjectName("playHeroBtn")
-        self.load_btn.clicked.connect(self._on_load)
         cancel_btn = QPushButton("Cancelar")
         cancel_btn.clicked.connect(self.reject)
+        none_btn = QPushButton("Reproducir sin subtítulos")
+        none_btn.clicked.connect(self._on_none)
+        load_btn = QPushButton("✓ Cargar seleccionados")
+        load_btn.setObjectName("playHeroBtn")
+        load_btn.clicked.connect(self._on_load)
         btn_row.addWidget(cancel_btn)
-        btn_row.addWidget(self.none_btn)
+        btn_row.addWidget(none_btn)
         btn_row.addStretch(1)
-        btn_row.addWidget(self.load_btn)
+        btn_row.addWidget(load_btn)
         layout.addLayout(btn_row)
 
+    # ------------------------------------------------------------------
+    @property
+    def chosen(self) -> list[str] | None:
+        """URLs elegidas, o None si el usuario canceló/cerró."""
+        return self._chosen
+
     def _on_none(self):
-        self.subs_selected.emit([])
+        self._chosen = []
         self.accept()
 
     def _on_load(self):
-        selected = []
+        urls = []
         for i in range(self.list_widget.count()):
             item = self.list_widget.item(i)
             if item.checkState() == Qt.Checked:
-                selected.append(item.data(Qt.UserRole))
-        # Si marcó varios, el primero marcado será el activo en mpv
-        self.subs_selected.emit(selected)
+                urls.append(item.data(Qt.UserRole))
+        self._chosen = urls
         self.accept()

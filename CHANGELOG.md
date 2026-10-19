@@ -1,5 +1,16 @@
 # Changelog — Visuales UCLV
 
+## 1.7.0
+- **Elegir subtítulos de la carpeta (pop-up)**: al abrir un video,
+  si la carpeta tiene archivos de subtítulo (`.srt`, `.sub`, `.ass`,
+  `.ssa`, `.vtt`), ahora aparece una ventana para escoger cuál (o
+  cuáles) cargar — de nada sirve la carga automática cuando los
+  nombres del sub. y del video no coinciden. Los que emparejan solos
+  vienen pre-marcados; "Cancelar" mantiene el comportamiento anterior.
+- Nuevo botón **📁 Subtítulos de la carpeta** en los controles del
+  reproductor, para abrir ese mismo pop-up en cualquier momento (por
+  ejemplo al continuar desde el historial, que no pasa por el pop-up).
+
 ## 1.6.1
 - **Arreglo**: cuando mpv arrancaba bien pero fallaba al cargar el
   video (ventana vacía "Drop files or URLs to play here", típico con

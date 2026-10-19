@@ -161,6 +161,7 @@ class MainWindow(QMainWindow):
     _imdb_ready_signal = Signal(str, str, str, int)     # (sinopsis, url_poster, error, request_id)
     _folder_scan_ready_signal = Signal(list, str, float)  # (archivos, nombre_raiz, bytes_totales)
     _add_subtitle_signal = Signal(str, str, bool)  # (url_video, url_subtitulo, seleccionar)
+    _folder_subs_ready_signal = Signal(str, list, str)  # (url_video, entradas_subs, error)
 
     def __init__(self):
         super().__init__()
@@ -194,6 +195,7 @@ class MainWindow(QMainWindow):
         self._imdb_ready_signal.connect(self._on_imdb_ready)
         self._folder_scan_ready_signal.connect(self._on_folder_scan_ready)
         self._add_subtitle_signal.connect(self._on_history_subtitle_ready)
+        self._folder_subs_ready_signal.connect(self._on_folder_subs_ready)
 
         APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
         self.favorites = self._load_favorites()
@@ -370,6 +372,7 @@ class MainWindow(QMainWindow):
         self.player.error_occurred.connect(self._show_error)
         self.player.track_finished.connect(self._on_video_finished)
         self.player.online_subtitles_requested.connect(self._on_online_subtitles_requested)
+        self.player.folder_subtitles_requested.connect(self._on_pick_folder_subs)
         self.stack.addWidget(self.player)
 
         self.detail_view = MovieDetailView()
@@ -558,8 +561,104 @@ class MainWindow(QMainWindow):
 
     def _on_detail_play_requested(self, url: str, name: str):
         entry = next((e for e in self._detail_entries if e.url == url), None)
-        subs = subtitle_urls_for(entry, self._detail_entries) if entry else []
-        self._open_player_with_resume(url, name, subtitle_urls=subs)
+        if entry:
+            self._play_video_with_sub_popup(entry, self._detail_entries)
+        else:
+            self._open_player_with_resume(url, name, subtitle_urls=[])
+
+    def _play_video_with_sub_popup(self, entry: Entry, siblings: list[Entry]):
+        """Abre el video mostrando antes un pop-up con TODOS los
+        subtítulos de la carpeta: los nombres no siempre coinciden con el
+        del video y la carga automática no los encuentra, así que se deja
+        que el usuario elija. Si cancela el pop-up, se usan los que
+        emparejan solos (comportamiento anterior)."""
+        auto_subs = subtitle_urls_for(entry, siblings)
+        folder_subs = [e for e in siblings if e.is_subtitle]
+        chosen = auto_subs
+        if folder_subs:
+            picked = self._ask_local_subs(entry.name, folder_subs, auto_subs)
+            if picked is not None:
+                chosen = picked
+        self._open_player_with_resume(entry.url, entry.name, subtitle_urls=chosen)
+
+    def _ask_local_subs(
+        self, video_name: str,
+        folder_subs: list[Entry], preselect: list[str],
+    ) -> list[str] | None:
+        """Muestra el pop-up de subtítulos locales. Devuelve las URLs
+        elegidas, [] si eligió "sin subtítulos", o None si canceló."""
+        dlg = LocalSubsDialog(
+            video_name,
+            [{"url": s.url, "name": s.name} for s in folder_subs],
+            preselect=preselect,
+            parent=self,
+        )
+        dlg.exec()
+        return dlg.chosen
+
+    def _on_pick_folder_subs(self):
+        """Botón del reproductor: elegir subtítulos de la carpeta del
+        video que se está reproduciendo ahora mismo."""
+        video_url = self.player.current_url
+        if not video_url:
+            return
+        subs = self._folder_subtitles_cached(video_url)
+        if subs:
+            self._apply_subs_choice(video_url, subs)
+            return
+        # No tenemos el listado a mano (ej. vino del historial): lo
+        # buscamos en segundo plano y avisamos por señal.
+        try:
+            self._io_executor.submit(self._fetch_folder_subs_bg, video_url)
+        except RuntimeError:
+            pass
+
+    def _folder_subtitles_cached(self, video_url: str) -> list[Entry]:
+        """Subtítulos de la carpeta del video, si el listado está en
+        memoria (vista de detalle o carpeta actual)."""
+        folder_url = video_url.rsplit("/", 1)[0] + "/"
+        if self._detail_folder_url == folder_url and self._detail_entries:
+            entries = self._detail_entries
+        elif self.current_url == folder_url and self.current_entries:
+            entries = self.current_entries
+        else:
+            return []
+        return [e for e in entries if e.is_subtitle]
+
+    def _fetch_folder_subs_bg(self, video_url: str):
+        folder_url = video_url.rsplit("/", 1)[0] + "/"
+        listing = self.client.list_dir(folder_url)  # cacheado en la mayoría de los casos
+        subs = [e for e in listing.entries if e.is_subtitle] if not listing.error else []
+        self._folder_subs_ready_signal.emit(video_url, subs, listing.error)
+
+    def _on_folder_subs_ready(self, video_url: str, subs: list[Entry], error: str):
+        if self.player.current_url != video_url:
+            return  # ya se cerró el player o cambió de video
+        if error:
+            self._show_error(f"No se pudo listar la carpeta del video: {error}")
+            return
+        if not subs:
+            QMessageBox.information(
+                self, "Subtítulos",
+                "No hay archivos de subtítulo en la misma carpeta que este video.\n"
+                "Probá con 🌐 Subtítulos (OpenSubtitles) o descargá uno.",
+            )
+            return
+        self._apply_subs_choice(video_url, subs)
+
+    def _apply_subs_choice(self, video_url: str, folder_subs: list[Entry]):
+        video_name = video_url.rsplit("/", 1)[-1]
+        entry = next(
+            (e for e in (self._detail_entries + self.current_entries) if e.url == video_url),
+            None,
+        )
+        preselect = subtitle_urls_for(entry, folder_subs) if entry else []
+        chosen = self._ask_local_subs(video_name, folder_subs, preselect)
+        if chosen is None:
+            return  # canceló: no tocamos lo que ya se está reproduciendo
+        # Reemplaza (no suma) para no repetir subtítulos si ya había
+        # algunos cargados de la carga automática.
+        self.player.replace_subtitles(chosen)
 
     def _show_raw_file_list(self):
         self._populate_list(self.current_entries)
@@ -983,10 +1082,7 @@ class MainWindow(QMainWindow):
         if entry.is_dir:
             self.navigate_to(entry.url, push_history=True)
         elif entry.is_video:
-            self._open_player_with_resume(
-                entry.url, entry.name,
-                subtitle_urls=subtitle_urls_for(entry, self.current_entries),
-            )
+            self._play_video_with_sub_popup(entry, self.current_entries)
         else:
             QMessageBox.information(
                 self, "Archivo no reproducible",
@@ -1033,10 +1129,7 @@ class MainWindow(QMainWindow):
         elif entry.is_video:
             menu.addAction(
                 "▶ Reproducir",
-                lambda: self._open_player_with_resume(
-                    entry.url, entry.name,
-                    subtitle_urls=subtitle_urls_for(entry, self.current_entries),
-                ),
+                lambda: self._play_video_with_sub_popup(entry, self.current_entries),
             )
             menu.addAction("⬇ Descargar", lambda: self._start_download(entry))
             if self.progress.fraction(entry.url) is not None:

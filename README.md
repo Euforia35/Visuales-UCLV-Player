@@ -92,10 +92,18 @@ python3 main.py
   continuar donde quedaste.
 - Los subtítulos que estén en la misma carpeta que el video (mismo
   nombre, con o sin sufijo de idioma como `.es.srt`) se cargan solos al
-  reproducir.
+  reproducir. Además, al abrir un video que tenga subtítulos en su
+  carpeta aparece un **pop-up para elegir cuál cargar** (lista todos
+  los `.srt`/`.ass`/etc. de la carpeta, aunque los nombres no tengan
+  nada que ver con el del video); los que emparejan solos vienen
+  pre-marcados y "Cancelar" deja la carga automática como siempre.
 - **Auto-avance**: al terminar un video, si hay otro video después en
   la misma carpeta (orden alfabético), lo reproduce solo — pensado para
   series (episodio 1 → 2 → 3…).
+- **Botón "📁 Subtítulos de la carpeta"** (en los controles del
+  reproductor): abre ese mismo pop-up en cualquier momento — sirve
+  cuando el video arrancó sin subtítulos (ej. desde el historial) o
+  cuando cargaste los equivocados.
 - **Botón "🌐 Subtítulos"** (en los controles del reproductor): busca
   subtítulos online en OpenSubtitles y los descarga/activa con un clic.
   La primera vez te pide una API Key gratuita (ver más abajo).

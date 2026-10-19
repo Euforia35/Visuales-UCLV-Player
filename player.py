@@ -37,6 +37,7 @@ class PlayerWidget(QWidget):
     error_occurred = Signal(str)
     track_finished = Signal()  # el video llegó al final de verdad (no pausa)
     online_subtitles_requested = Signal()
+    folder_subtitles_requested = Signal()  # elegir un sub. de la carpeta del video
     _pause_state_signal = Signal(bool)  # puente hilo IPC -> hilo GUI
 
     IDLE_TEXT = (
@@ -124,6 +125,13 @@ class PlayerWidget(QWidget):
         self.online_subs_btn.setToolTip("Buscar subtítulos online (OpenSubtitles)")
         self.online_subs_btn.clicked.connect(self.online_subtitles_requested.emit)
 
+        self.folder_subs_btn = QPushButton("📁 Subtítulos de la carpeta")
+        self.folder_subs_btn.setToolTip(
+            "Elegir un archivo de subtítulo de la misma carpeta del video "
+            "(cuando los nombres no coinciden y no se carga solo)"
+        )
+        self.folder_subs_btn.clicked.connect(self.folder_subtitles_requested.emit)
+
         self.volume_slider = QSlider(Qt.Horizontal)
         self.volume_slider.setRange(0, 100)
         self.volume_slider.setValue(100)
@@ -133,7 +141,7 @@ class PlayerWidget(QWidget):
         self.fullscreen_btn = QPushButton("⛶ Pantalla completa")
         self.fullscreen_btn.clicked.connect(self._toggle_fullscreen)
 
-        for w in (self.play_btn, self.stop_btn, self.back10_btn, self.fwd10_btn, self.sub_btn, self.online_subs_btn):
+        for w in (self.play_btn, self.stop_btn, self.back10_btn, self.fwd10_btn, self.sub_btn, self.folder_subs_btn, self.online_subs_btn):
             btn_row.addWidget(w)
         btn_row.addStretch(1)
         btn_row.addWidget(QLabel("🔊"))
@@ -152,7 +160,7 @@ class PlayerWidget(QWidget):
     def _set_controls_enabled(self, enabled: bool):
         for w in (
             self.play_btn, self.stop_btn, self.back10_btn, self.fwd10_btn,
-            self.sub_btn, self.online_subs_btn, self.volume_slider,
+            self.sub_btn, self.folder_subs_btn, self.online_subs_btn, self.volume_slider,
             self.fullscreen_btn, self.seek_slider,
         ):
             w.setEnabled(enabled)
@@ -318,6 +326,24 @@ class PlayerWidget(QWidget):
             if select:
                 self.sub_btn.setChecked(True)
                 self._mpv.set_sub_visibility(True)
+
+    def replace_subtitles(self, urls: list[str]):
+        """Carga los subtítulos elegidos por el usuario en el pop-up,
+        dejando el primero como pista activa. Las pistas que ya estaban
+        cargadas (carga automática) no se pueden listar/borrar por IPC
+        sin respuestas, así que quedan como alternativas y se pueden
+        ciclar dentro de mpv con j/k."""
+        if not (self._mpv and self._mpv.is_running()):
+            return
+        for i, url in enumerate(urls):
+            self._mpv.add_subtitle(url, select=(i == 0))
+        if urls:
+            self.sub_btn.setChecked(True)
+            self._mpv.set_sub_visibility(True)
+        else:
+            # eligió "sin subtítulos": oculta los que ya estaban cargados
+            self.sub_btn.setChecked(False)
+            self._mpv.set_sub_visibility(False)
 
     def current_title(self) -> str:
         return self._current_title
