@@ -37,6 +37,7 @@ from audio_metadata import AudioMetadataManager
 from lyrics import fetch_lyrics
 from config_store import ConfigStore
 from online_dialogs import ApiKeyDialog, SubtitleSearchDialog
+from local_subs_dialog import LocalSubsDialog
 import tmdb
 from history_view import HistoryView, COVER_SIZE as HISTORY_COVER_SIZE
 from catalog import SiteCatalog
