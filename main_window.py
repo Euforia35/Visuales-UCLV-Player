@@ -47,6 +47,7 @@ from cards import CardData, POSTER_SIZE as CARD_POSTER_SIZE
 from home_view import HomeView
 from history_view import HistoryView, COVER_SIZE as HISTORY_COVER_SIZE
 from catalog import SiteCatalog
+from sitemap import SiteMap
 from search_dialog import GlobalSearchDialog
 
 APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "VisualesUCLV"
@@ -60,7 +61,7 @@ DOWNLOADS_DIR = Path.home() / "Downloads" / "VisualesUCLV"
 PROGRESS_SAVE_INTERVAL_MS = 5000
 HOME_STALE_SECONDS = 300  # el home se refresca solo si tiene más de 5 min
 
-BASE_URL = "http://visuales.uclv.cu/"
+BASE_URL = "https://visuales.uclv.cu/"
 
 # Tamaños con los que se cachean las imágenes grandes (backdrops). Qt
 # escala después desde estos tamaños al redibujar.
@@ -183,6 +184,11 @@ class MainWindow(QMainWindow):
         self.resize(1220, 780)
 
         self.client = ApacheIndexClient(BASE_URL)
+        # Árbol de carpetas del sitio (listado.html que publica el
+        # servidor): evita escanear carpeta por carpeta para el home.
+        self.sitemap = SiteMap(
+            BASE_URL, APP_SUPPORT_DIR / "sitemap.json", session=self.client.session
+        )
         self.history: list[str] = []
         self.history_pos = -1
         self.current_entries: list[Entry] = []
@@ -1058,14 +1064,66 @@ class MainWindow(QMainWindow):
         except RuntimeError:
             pass  # la app se está cerrando
 
+    # Límites del escaneo del home: el árbol real del servidor es
+    # profundo (Peliculas/Extranjeras/1900s/1901/Film/) y no queremos
+    HOME_CARDS_PER_ROW = 24
+
+    def _collect_playable_folders(self, root_url: str, limit: int) -> list[Entry]:
+        """Carpetas \"de contenido\" dentro de una categoría, usando el
+        árbol que publica el servidor (`listado.html`) en vez de escanear
+        carpeta por carpeta. Cae al escaneo directo si no hay árbol."""
+        root_path = urlparse(root_url).path.rstrip("/")
+        if self.sitemap.paths:
+            folders = self.sitemap.content_folders(root_path, limit=limit)
+            if folders:
+                return [
+                    Entry(name=f.rsplit("/", 1)[-1], url=BASE_URL.rstrip("/") + f + "/",
+                          is_dir=True)
+                    for f in folders
+                ]
+        return self._scan_playable_folders(root_url, limit)
+
+    def _scan_playable_folders(self, root_url: str, limit: int) -> list[Entry]:
+        """Respaldo sin árbol: BFS acotado buscando carpetas con video."""
+        results: list[Entry] = []
+        listings = 0
+        queue: list[tuple[str, int]] = [(root_url, 0)]
+        visited: set[str] = {root_url}
+        while queue and listings < 40 and len(results) < limit:
+            folder_url, depth = queue.pop(0)
+            listing = self.client.list_dir(folder_url)
+            listings += 1
+            if listing.error:
+                continue
+            subdirs = [e for e in listing.entries if e.is_dir]
+            if any(e.is_video for e in listing.entries) and folder_url != root_url:
+                results.append(Entry(
+                    name=[p for p in urlparse(folder_url).path.split("/") if p][-1] or folder_url,
+                    url=folder_url, is_dir=True,
+                ))
+                continue
+            if depth >= 5:
+                continue
+            for e in subdirs:
+                if e.url not in visited:
+                    visited.add(e.url)
+                    queue.append((e.url, depth + 1))
+        return results
+
     def _load_home_bg(self):
-        """Corre en background: arma las filas del home a partir de las
-        carpetas de categorías + progreso + favoritos, y emite la
+        """Corre en background: arma las filas del home a partir del
+        árbol de carpetas del sitio + progreso + favoritos, y emite la
         estructura completa de una."""
         rows: list[tuple[str, str, list[CardData]]] = []
-        recent_pool: list[tuple[float, Entry]] = []
         series_cards: list[CardData] = []
         movie_cards: list[CardData] = []
+
+        # Descarga/actualiza el árbol del sitio si hace falta (una sola
+        # descarga de listado.html; después queda cacheado en disco).
+        try:
+            self.sitemap.ensure_loaded()
+        except Exception:
+            pass
 
         row_titles = {
             "movies": "Películas",
@@ -1079,19 +1137,14 @@ class MainWindow(QMainWindow):
         }
         for _label, folder in CATEGORY_SHORTCUTS:
             url = BASE_URL + folder + "/"
-            listing = self.client.list_dir(url)
-            if listing.error:
+            entries = self._collect_playable_folders(url, self.HOME_CARDS_PER_ROW)
+            if not entries:
                 continue
-            entries = [e for e in listing.entries if e.is_dir or e.is_video]
-            cards = [self._card_for_entry(e) for e in entries[:24]]
+            cards = [self._card_for_entry(e) for e in entries[: self.HOME_CARDS_PER_ROW]]
             if not cards:
                 continue
             key = folder_keys.get(folder.lower(), folder.lower())
             rows.append((key, row_titles.get(key, folder), cards))
-            for e in entries:
-                stamp = self._parse_entry_date(e.date)
-                if stamp:
-                    recent_pool.append((stamp, e))
             if key == "series":
                 series_cards = cards
             elif key == "movies":
@@ -1110,11 +1163,16 @@ class MainWindow(QMainWindow):
         if continue_cards:
             rows.insert(0, ("continue", "Continuar viendo", continue_cards))
 
-        # --- Agregados recientemente (fecha del listado de Apache) ---
-        recent_pool.sort(key=lambda pair: pair[0], reverse=True)
+        # --- Agregados recientemente: el sitio expone una carpeta
+        # "Recientes" en la raíz, así que la usamos directamente en vez
+        # de inferir fechas (el árbol de carpetas no las trae). ---
         seen_urls = {c.url for _k, _t, cards in rows for c in cards}
+        if any(p.startswith("/Recientes/") for p in self.sitemap.paths):
+            recent_entries = self._collect_playable_folders(BASE_URL + "Recientes/", 16)
+        else:
+            recent_entries = []
         recent_cards = [
-            self._card_for_entry(e) for _stamp, e in recent_pool[:16] if e.url not in seen_urls
+            self._card_for_entry(e) for e in recent_entries if e.url not in seen_urls
         ]
         if recent_cards:
             rows.append(("recent", "Agregados recientemente", recent_cards))

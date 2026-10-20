@@ -38,6 +38,15 @@ _VIDEO_EXT_RE = re.compile(r"\.[A-Za-z0-9]{2,4}$")
 
 _EPISODE_PATTERNS = [
     re.compile(r"\bs(\d{1,2})[\s._-]*e(\d{1,3})\b", re.IGNORECASE),
+    # Formato de visuales.uclv.cu: "Breaking Bad Season 1 Episode 01 - Pilot"
+    re.compile(
+        r"\bseason[\s._-]*(\d{1,2})[\s._-]*episode[\s._-]*(\d{1,3})\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\btemporada[\s._-]*(\d{1,2})[\s._-]*(?:episodio|capitulo|cap)[\s._-]*(\d{1,3})\b",
+        re.IGNORECASE,
+    ),
     re.compile(r"\b(\d{1,2})x(\d{1,3})\b"),
     re.compile(r"\bep?(?:isodio)?[\s._-]*(\d{1,3})\b", re.IGNORECASE),
     re.compile(r"\bcap(?:itulo)?[\s._-]*(\d{1,3})\b", re.IGNORECASE),
@@ -46,8 +55,19 @@ _EPISODE_PATTERNS = [
 # Marcador de episodio unificado (para partir título antes/después)
 _MARKER_RE = re.compile(
     r"\bs\d{1,2}[\s._-]*e\d{1,3}\b"
+    r"|\bseason[\s._-]*\d{1,2}[\s._-]*episode[\s._-]*\d{1,3}\b"
+    r"|\btemporada[\s._-]*\d{1,2}[\s._-]*(?:episodio|capitulo|cap)[\s._-]*\d{1,3}\b"
     r"|\b\d{1,2}x\d{1,3}\b"
     r"|\b(?:ep|episodio|cap|capitulo)[\s._-]*\d{1,3}\b",
+    re.IGNORECASE,
+)
+
+
+# Marcador "Season N Episode M" (formato de visuales.uclv.cu), usado para
+# decidir el orden del título en episode_display.
+_SEASON_EPISODE_WORDS_RE = re.compile(
+    r"\bseason[\s._-]*\d{1,2}[\s._-]*episode\b"
+    r"|\btemporada[\s._-]*\d{1,2}[\s._-]*(?:episodio|capitulo|cap)\b",
     re.IGNORECASE,
 )
 
@@ -167,7 +187,15 @@ def episode_display(name: str) -> str:
     if title_before and re.match(LOGO_RE, title_before, re.IGNORECASE):
         title_before = ""
 
-    title = title_before or title_after
+    # En el formato del servidor ("Serie Season 1 Episode 01 - Pilot") el
+    # nombre de la serie va ANTES del marcador y el título del capítulo
+    # DESPUÉS; ahí el capítulo es más útil para reconocer cada episodio.
+    # En los formatos con el marcador al principio ("Serie.S01E05") el
+    # orden normal ya deja lo mejor en `title_before`.
+    if _SEASON_EPISODE_WORDS_RE.search(raw):
+        title = title_after or title_before
+    else:
+        title = title_before or title_after
     if not title:
         title = clean_display_title(raw)
     if label and title:
