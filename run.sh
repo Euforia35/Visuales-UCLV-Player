@@ -47,32 +47,29 @@ else
 fi
 
 # ----------------------------------------------------------------------
-# 3) Python 3
+# 4) Python + dependencias
 # ----------------------------------------------------------------------
-if ! command -v python3 >/dev/null 2>&1; then
-    info "Instalando python3 con Homebrew…"
-    brew install python@3.12
-else
-    ok "python3 encontrado ($(python3 --version))"
+# Intérprete con las dependencias. Por defecto el de Miniconda (que ya
+# las tiene); se puede sobreescribir con PYTHON_BIN=…
+PYTHON_BIN="${PYTHON_BIN:-/opt/miniconda3/bin/python}"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python3)"
+    else
+        info "Instalando python3 con Homebrew…"
+        brew install python@3.12
+        PYTHON_BIN="$(command -v python3)"
+    fi
 fi
-
-# ----------------------------------------------------------------------
-# 4) Entorno virtual + dependencias de Python
-# ----------------------------------------------------------------------
-if [[ ! -d "venv" ]]; then
-    info "Creando entorno virtual…"
-    python3 -m venv venv
-fi
-
-source venv/bin/activate
+ok "Usando Python: $PYTHON_BIN ($("$PYTHON_BIN" --version))"
 
 info "Revisando/instalando dependencias de Python (rápido si ya están)…"
-pip install --quiet --upgrade pip
-pip install --quiet -r requirements.txt
+"$PYTHON_BIN" -m pip install --quiet --upgrade pip
+"$PYTHON_BIN" -m pip install --quiet -r requirements.txt
 ok "Dependencias listas"
 
 # ----------------------------------------------------------------------
 # 5) Arrancar la app
 # ----------------------------------------------------------------------
 info "Abriendo Visuales UCLV…"
-python3 main.py
+"$PYTHON_BIN" main.py

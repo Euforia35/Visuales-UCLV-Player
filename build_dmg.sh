@@ -13,7 +13,7 @@
 # solo comando de instalación, mucho más liviano que pedirle a alguien
 # que instale Python + todo lo demás.
 #
-# Uso (desde la carpeta del proyecto, con el venv ya armado):
+# Uso (desde la carpeta del proyecto):
 #   chmod +x build_dmg.sh
 #   ./build_dmg.sh
 #
@@ -29,18 +29,23 @@ APP_VERSION="$(cat VERSION 2>/dev/null || echo "0.0.0")"
 APP_NAME="Visuales UCLV"
 DMG_NAME="${APP_NAME}-${APP_VERSION}.dmg"
 
-if [[ ! -d "venv" ]]; then
-    echo "⚠ No encuentro el entorno virtual (venv) en esta carpeta."
-    echo "  Corré primero ./run.sh al menos una vez para instalar todo."
+# Intérprete con las dependencias (por defecto Miniconda). Override: PYTHON_BIN=…
+PYTHON_BIN="${PYTHON_BIN:-/opt/miniconda3/bin/python}"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+    PYTHON_BIN="$(command -v python3 || true)"
+fi
+if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then
+    echo "⚠ No encuentro un intérprete de Python3. Pasá PYTHON_BIN=/ruta/a/python."
+    exit 1
+fi
+if ! "$PYTHON_BIN" -c "import PySide6" >/dev/null 2>&1; then
+    echo "⚠ $PYTHON_BIN no tiene PySide6. Instalá: $PYTHON_BIN -m pip install -r requirements.txt"
     exit 1
 fi
 
-# shellcheck disable=SC1091
-source venv/bin/activate
-
-if ! python3 -c "import py2app" 2>/dev/null; then
+if ! "$PYTHON_BIN" -c "import py2app" 2>/dev/null; then
     echo "➜ Instalando py2app…"
-    pip install py2app
+    "$PYTHON_BIN" -m pip install py2app
 fi
 
 # Genera el ícono .icns si no existe todavía (mismo proceso que build_app.sh)
@@ -59,7 +64,7 @@ fi
 
 echo "➜ Empaquetando con py2app (puede tardar varios minutos)…"
 rm -rf build dist
-python3 setup.py py2app
+"$PYTHON_BIN" setup.py py2app
 
 APP_BUNDLE="dist/${APP_NAME}.app"
 if [[ ! -d "$APP_BUNDLE" ]]; then
