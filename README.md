@@ -123,6 +123,14 @@ python3 main.py
   detalle): busca la sinopsis en español en TMDb (The Movie Database)
   para cuando `sinopsis.txt` no está o no te convence la que hay.
   También pide una API Key gratuita la primera vez.
+- **Botón "✏ Corregir nombre"** (en la vista de detalle): si la carpeta
+  del servidor tiene el título mal escrito (ej. `The mandalorian X1`) y
+  TMDb no encuentra nada, acá escribís el nombre correcto
+  (`The Mandalorian (2019)`) y la app busca con ESE nombre. Queda
+  guardado para esa carpeta en
+  `~/Library/Application Support/VisualesUCLV/title_overrides.json`, así
+  que no hay que repetirlo. Si buscás con el botón de TMDb y no aparece
+  nada, la app te ofrece corregir el nombre en el momento.
 
 ### API Keys gratuitas (subtítulos online + sinopsis en español)
 
@@ -245,7 +253,8 @@ downloads.py         → gestor de descargas en segundo plano
 main_window.py       → ventana principal: navegación, favoritos, grilla,
                        descargas, menús contextuales, home y metadatos
 naming.py            → nombres de archivo crudos → títulos legibles
-metadata.py          → caché local de metadatos (TMDb + heurística)
+metadata.py          → caché local de metadatos (TMDb + heurística) y
+                       títulos corregidos a mano (title_overrides.json)
 tmdb.py              → ficha completa en TMDb (sinopsis, póster, backdrop,
                        año, duración, géneros, rating)
 cards.py             → tarjetas y filas horizontales estilo streaming

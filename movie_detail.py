@@ -31,6 +31,7 @@ class MovieDetailView(QWidget):
     play_requested = Signal(str, str)
     show_files_requested = Signal()
     imdb_requested = Signal()
+    edit_title_requested = Signal()
 
     POSTER_SIZE = (168, 252)         # póster dentro del hero
 
@@ -117,6 +118,15 @@ class MovieDetailView(QWidget):
         self.tmdb_btn.setToolTip("Busca sinopsis en español, póster, año, género y rating en TMDb")
         self.tmdb_btn.clicked.connect(self.imdb_requested.emit)
         buttons.addWidget(self.tmdb_btn)
+        self.edit_title_btn = QPushButton("✏  Corregir nombre")
+        self.edit_title_btn.setObjectName("ghostBtn")
+        self.edit_title_btn.setCursor(Qt.PointingHandCursor)
+        self.edit_title_btn.setToolTip(
+            "Si el nombre de la carpeta está mal escrito y TMDb no encuentra "
+            "nada, escribí acá el nombre correcto para la búsqueda"
+        )
+        self.edit_title_btn.clicked.connect(self.edit_title_requested.emit)
+        buttons.addWidget(self.edit_title_btn)
         buttons.addStretch(1)
         info_col.addLayout(buttons)
 
@@ -188,6 +198,11 @@ class MovieDetailView(QWidget):
     def set_meta(self, text: str):
         self.meta_label.setText(text)
         self.meta_label.setVisible(bool(text))
+
+    def set_title(self, title: str):
+        """Cambia solo el título visible (ej. al corregir el nombre a mano)."""
+        if title:
+            self.title_label.setText(title)
 
     def set_chips(self, chips: list[str]):
         """Chips de metadatos bajo el título. Los que parecen rating

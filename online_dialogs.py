@@ -60,6 +60,59 @@ class ApiKeyDialog(QDialog):
         self.accept()
 
 
+class SearchTitleDialog(QDialog):
+    """Deja corregir a mano el nombre con el que se busca la ficha en
+    TMDb, para carpetas del servidor con el título mal escrito
+    (ej. "The mandalorian X1" → "The Mandalorian").
+
+    Devuelve el título en `self.title` (vacío = sin cambios)."""
+
+    def __init__(self, current: str, is_series: bool, parent=None):
+        super().__init__(parent)
+        self.title = ""
+        self.setWindowTitle("Corregir nombre para la búsqueda")
+        self.resize(460, 220)
+
+        layout = QVBoxLayout(self)
+
+        hint = QLabel(
+            "A veces la carpeta del servidor tiene el nombre mal escrito y "
+            "la búsqueda en TMDb no encuentra nada. Escribí acá el nombre "
+            f"correcto de la {'serie' if is_series else 'película'}.\n\n"
+            "Si querés el año exacto, agregalo entre paréntesis: "
+            "«The Mandalorian (2019)»."
+        )
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.title_input = QLineEdit(current)
+        self.title_input.setPlaceholderText("Título correcto…")
+        self.title_input.selectAll()
+        self.title_input.returnPressed.connect(self._on_save)
+        layout.addWidget(self.title_input)
+
+        btn_row = QHBoxLayout()
+        cancel_btn = QPushButton("Cancelar")
+        cancel_btn.clicked.connect(self.reject)
+        save_btn = QPushButton("🔍  Buscar con este nombre")
+        save_btn.setObjectName("playHeroBtn")
+        save_btn.clicked.connect(self._on_save)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(save_btn)
+        layout.addLayout(btn_row)
+
+    def _on_save(self):
+        title = self.title_input.text().strip()
+        if not title:
+            QMessageBox.warning(
+                self, "Nombre vacío",
+                "Escribí un nombre para buscar (o «Cancelar» para dejarlo igual).",
+            )
+            return
+        self.title = title
+        self.accept()
+
+
 class SubtitleSearchDialog(QDialog):
     """Busca subtítulos en OpenSubtitles y permite elegir uno para usar."""
 
