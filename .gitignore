@@ -14,3 +14,8 @@ dist/
 
 # macOS
 .DS_Store
+
+# Archivos sueltos que no son parte del proyecto
+*.srt
+mpv-shot*.jpg
+New Text Document.txt

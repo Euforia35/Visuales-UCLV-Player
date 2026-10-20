@@ -14,7 +14,7 @@ from setuptools import setup
 VERSION = (Path(__file__).parent / "VERSION").read_text().strip()
 
 APP = ["main.py"]
-DATA_FILES = ["style.qss"]
+DATA_FILES = []
 OPTIONS = {
     "argv_emulation": False,
     "includes": [
@@ -22,8 +22,8 @@ OPTIONS = {
         "downloads", "mpv_ipc", "movie_detail", "music_view", "audio_metadata",
         "lyrics", "config_store", "opensubtitles", "tmdb", "online_dialogs",
         "history_view", "catalog", "search_dialog", "local_subs_dialog",
+        "theme", "naming", "cards", "metadata", "home_view",
     ],
-    "resources": ["style.qss"],
     "plist": {
         "CFBundleName": "Visuales UCLV",
         "CFBundleDisplayName": "Visuales UCLV",

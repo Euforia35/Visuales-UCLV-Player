@@ -13,10 +13,10 @@ Empaquetar como app de macOS (doble clic):
 """
 
 import sys
-from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 
+import theme
 from main_window import MainWindow
 
 
@@ -24,9 +24,7 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Visuales UCLV")
 
-    qss_path = Path(__file__).parent / "style.qss"
-    if qss_path.exists():
-        app.setStyleSheet(qss_path.read_text())
+    app.setStyleSheet(theme.build_stylesheet())
 
     window = MainWindow()
     window.show()

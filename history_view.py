@@ -13,6 +13,8 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QListWidget, QListWidgetItem, QMenu,
 )
 
+import theme
+
 COVER_SIZE = (70, 100)
 
 
@@ -82,7 +84,7 @@ class HistoryView(QWidget):
             )
             litem = QListWidgetItem(text)
             placeholder = QPixmap(*COVER_SIZE)
-            placeholder.fill(QColor("#1E2127"))
+            placeholder.fill(QColor(theme.SURFACE))
             litem.setIcon(QIcon(placeholder))
             litem.setData(Qt.UserRole, item)
             self.list_widget.addItem(litem)
