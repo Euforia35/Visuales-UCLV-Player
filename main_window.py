@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse, unquote
@@ -27,7 +28,7 @@ from player import PlayerWidget, _fmt_time
 from progress import ProgressStore
 from thumbnails import (
     ThumbnailManager, candidate_urls_for,
-    in_folder_poster_candidates,
+    in_folder_poster_candidates, in_folder_backdrop_candidates,
     _looks_like_real_image, _revalidate_and_reencode,
 )
 from downloads import DownloadManager
@@ -39,6 +40,11 @@ from config_store import ConfigStore
 from online_dialogs import ApiKeyDialog, SubtitleSearchDialog
 from local_subs_dialog import LocalSubsDialog
 import tmdb
+import theme
+from naming import clean_display_title, episode_display, parse_year
+from metadata import MetadataStore, MediaMeta, meta_from_tmdb_info
+from cards import CardData, POSTER_SIZE as CARD_POSTER_SIZE
+from home_view import HomeView
 from history_view import HistoryView, COVER_SIZE as HISTORY_COVER_SIZE
 from catalog import SiteCatalog
 from search_dialog import GlobalSearchDialog
@@ -48,11 +54,17 @@ FAVORITES_FILE = APP_SUPPORT_DIR / "favorites.json"
 PROGRESS_FILE = APP_SUPPORT_DIR / "progress.json"
 CONFIG_FILE = APP_SUPPORT_DIR / "config.json"
 CATALOG_FILE = APP_SUPPORT_DIR / "catalog.json"
+METADATA_CACHE_FILE = APP_SUPPORT_DIR / "metadata_cache.json"
 THUMBNAILS_DIR = APP_SUPPORT_DIR / "thumbnails_v2"  # v2: caché re-validada con Pillow (ver thumbnails.py)
 DOWNLOADS_DIR = Path.home() / "Downloads" / "VisualesUCLV"
 PROGRESS_SAVE_INTERVAL_MS = 5000
+HOME_STALE_SECONDS = 300  # el home se refresca solo si tiene más de 5 min
 
 BASE_URL = "http://visuales.uclv.cu/"
+
+# Tamaños con los que se cachean las imágenes grandes (backdrops). Qt
+# escala después desde estos tamaños al redibujar.
+BACKDROP_SIZE = QSize(1280, 720)
 
 # Accesos directos a las carpetas principales del sitio, mostrados en el
 # sidebar. El segundo valor debe coincidir EXACTO con el nombre de la
@@ -140,9 +152,9 @@ def _fmt_bytes(n: float) -> str:
 def _make_placeholder(entry: Entry) -> QPixmap:
     """Carátula genérica mientras se busca/descarga la real (o si no hay)."""
     pix = QPixmap(GRID_ICON_SIZE)
-    pix.fill(QColor("#1E2127") if entry.is_dir else QColor("#242830"))
+    pix.fill(QColor(theme.SURFACE) if entry.is_dir else QColor(theme.SURFACE_ALT))
     painter = QPainter(pix)
-    painter.setPen(QColor("#4A4F59"))
+    painter.setPen(QColor(theme.GLYPH_DIM))
     font = QFont()
     font.setPointSize(30)
     painter.setFont(font)
@@ -158,10 +170,12 @@ class MainWindow(QMainWindow):
     _listing_ready_signal = Signal(object, bool, int)  # (DirListing, push_history, request_id)
     _synopsis_ready_signal = Signal(str, str, int)  # (texto, error, request_id)
     _lyrics_ready_signal = Signal(str, str)        # (letra, error)
-    _imdb_ready_signal = Signal(str, str, str, int)     # (sinopsis, url_poster, error, request_id)
+    _imdb_ready_signal = Signal(object, str, str, int)  # (info dict|None, error, folder_url, request_id)
     _folder_scan_ready_signal = Signal(list, str, float)  # (archivos, nombre_raiz, bytes_totales)
     _add_subtitle_signal = Signal(str, str, bool)  # (url_video, url_subtitulo, seleccionar)
     _folder_subs_ready_signal = Signal(str, list, str)  # (url_video, entradas_subs, error)
+    _home_ready_signal = Signal(object)           # (estructura de filas/hero del home)
+    _meta_ready_signal = Signal(str, object)      # (folder_url, MediaMeta enriquecido)
 
     def __init__(self):
         super().__init__()
@@ -205,16 +219,21 @@ class MainWindow(QMainWindow):
         self.downloads = DownloadManager(self.client.session, DOWNLOADS_DIR)
         self.downloads.progress.connect(self._on_download_progress)
         self.downloads.status_changed.connect(self._on_download_status)
-        self._download_items: dict[str, QListWidgetItem] = {}
+        self._download_labels: dict[str, str] = {}
         self.audio_metadata = AudioMetadataManager(self.client.session)
         self.audio_metadata.metadata_ready.connect(self._on_track_metadata_ready)
         self._music_folder_poster_key: str | None = None
         self.config = ConfigStore(CONFIG_FILE)
+        self.meta_store = MetadataStore(METADATA_CACHE_FILE)
+        self._home_built_at = 0.0
         self.catalog = SiteCatalog(self.client, CATALOG_FILE)
         self.catalog.progress.connect(self._on_catalog_progress)
         self.catalog.finished.connect(self._on_catalog_finished)
         self._active_search_dialog: GlobalSearchDialog | None = None
         self._indexing_in_progress = False
+
+        self._home_ready_signal.connect(self._on_home_ready)
+        self._meta_ready_signal.connect(self._on_meta_ready)
 
         self._build_ui()
 
@@ -223,114 +242,65 @@ class MainWindow(QMainWindow):
         self._progress_timer.timeout.connect(self._save_current_progress)
         self._progress_timer.start()
 
-        self._show_history()
+        self._show_home()
 
     # ------------------------------------------------------------------
     # UI
     # ------------------------------------------------------------------
     def _build_ui(self):
         root = QWidget()
-        root_layout = QHBoxLayout(root)
+        root_layout = QVBoxLayout(root)
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
 
-        # --- Sidebar -----------------------------------------------------
-        sidebar = QWidget()
-        sidebar.setObjectName("sidebar")
-        sidebar.setFixedWidth(230)
-        side_layout = QVBoxLayout(sidebar)
-        side_layout.setContentsMargins(16, 20, 16, 20)
-        side_layout.setSpacing(6)
+        # --- Barra superior estilo streaming ------------------------------
+        # Sin sidebar: la navegación principal vive acá (menú "Explorar",
+        # buscador e íconos), así las filas de tarjetas ganan todo el ancho.
+        topbar = QWidget()
+        topbar.setObjectName("topbar")
+        topbar_layout = QHBoxLayout(topbar)
+        topbar_layout.setContentsMargins(22, 12, 22, 12)
+        topbar_layout.setSpacing(12)
 
-        logo = QLabel("VISUALES\nUCLV")
+        logo = QLabel("VISUALES UCLV")
         logo.setObjectName("logo")
-        side_layout.addWidget(logo)
-        side_layout.addSpacing(18)
+        topbar_layout.addWidget(logo)
+        topbar_layout.addSpacing(8)
 
-        self.history_btn = QPushButton("🕐  Historial")
-        self.history_btn.clicked.connect(self._show_history)
-        side_layout.addWidget(self.history_btn)
-
-        self.home_btn = QPushButton("🏠  Inicio")
-        self.home_btn.clicked.connect(lambda: self.navigate_to(BASE_URL, push_history=True))
-        side_layout.addWidget(self.home_btn)
-
-        side_layout.addSpacing(14)
-        cat_label = QLabel("CATEGORÍAS")
-        cat_label.setObjectName("sectionLabel")
-        side_layout.addWidget(cat_label)
-
+        # Menú desplegable "Explorar ▾" (Inicio + categorías + historial)
+        self.explore_btn = QToolButton()
+        self.explore_btn.setObjectName("exploreBtn")
+        self.explore_btn.setText("Explorar ▾")
+        self.explore_btn.setPopupMode(QToolButton.InstantPopup)
+        self.explore_btn.setToolTip("Navegar por el catálogo")
+        explore_menu = QMenu(self.explore_btn)
+        explore_menu.addAction("🏠  Inicio", self._show_home)
+        explore_menu.addAction("🕐  Historial", self._show_history)
+        explore_menu.addSeparator()
         for label, folder in CATEGORY_SHORTCUTS:
-            btn = QPushButton(label)
-            btn.clicked.connect(lambda checked=False, f=folder: self.navigate_to(BASE_URL + f + "/", push_history=True))
-            side_layout.addWidget(btn)
+            explore_menu.addAction(
+                label,
+                lambda checked=False, f=folder: self.navigate_to(
+                    BASE_URL + f + "/", push_history=True
+                ),
+            )
+        self.explore_btn.setMenu(explore_menu)
+        topbar_layout.addWidget(self.explore_btn)
 
-        side_layout.addSpacing(14)
-        fav_label = QLabel("FAVORITOS")
-        fav_label.setObjectName("sectionLabel")
-        side_layout.addWidget(fav_label)
-
-        self.fav_list = QListWidget()
-        self.fav_list.setObjectName("favList")
-        self.fav_list.setMaximumHeight(120)
-        self.fav_list.itemDoubleClicked.connect(self._open_favorite)
-        side_layout.addWidget(self.fav_list)
-        self._refresh_fav_list()
-
-        side_layout.addStretch(1)
-
-        dl_header = QHBoxLayout()
-        dl_label = QLabel("DESCARGAS")
-        dl_label.setObjectName("sectionLabel")
-        dl_header.addWidget(dl_label)
-        dl_header.addStretch(1)
-        open_folder_btn = QToolButton()
-        open_folder_btn.setText("📂")
-        open_folder_btn.setToolTip("Abrir carpeta de descargas")
-        open_folder_btn.clicked.connect(self._open_downloads_folder)
-        dl_header.addWidget(open_folder_btn)
-        side_layout.addLayout(dl_header)
-
-        self.downloads_list = QListWidget()
-        self.downloads_list.setObjectName("downloadsList")
-        self.downloads_list.setMaximumHeight(90)
-        self.downloads_list.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.downloads_list.customContextMenuRequested.connect(self._show_downloads_menu)
-        side_layout.addWidget(self.downloads_list)
-
-        root_layout.addWidget(sidebar)
-
-        # --- Panel principal ----------------------------------------------
-        main_panel = QWidget()
-        main_layout = QVBoxLayout(main_panel)
-        main_layout.setContentsMargins(20, 16, 20, 16)
-        main_layout.setSpacing(10)
-
-        top_row = QHBoxLayout()
-        self.back_btn = QToolButton()
-        self.back_btn.setText("◀")
-        self.back_btn.clicked.connect(self.go_back)
-        self.fwd_btn = QToolButton()
-        self.fwd_btn.setText("▶")
-        self.fwd_btn.clicked.connect(self.go_forward)
-        self.refresh_btn = QToolButton()
-        self.refresh_btn.setText("⟳")
-        self.refresh_btn.clicked.connect(self.refresh_current)
-
-        self.breadcrumb = QLabel("")
-        self.breadcrumb.setObjectName("breadcrumb")
-        self.breadcrumb.setWordWrap(True)
+        topbar_layout.addStretch(1)
 
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("Filtrar acá, o Enter para buscar en todo el sitio…")
         self.search_box.textChanged.connect(self._apply_filter)
         self.search_box.returnPressed.connect(self._on_global_search_requested)
-        self.search_box.setFixedWidth(260)
+        self.search_box.setFixedWidth(300)
+        topbar_layout.addWidget(self.search_box)
 
         self.global_search_btn = QToolButton()
         self.global_search_btn.setText("🔍")
         self.global_search_btn.setToolTip("Buscar en todo el servidor (no solo esta carpeta)")
         self.global_search_btn.clicked.connect(self._on_global_search_requested)
+        topbar_layout.addWidget(self.global_search_btn)
 
         self.view_toggle_btn = QPushButton("🖼 Vista grilla")
         self.view_toggle_btn.setCheckable(True)
@@ -338,20 +308,63 @@ class MainWindow(QMainWindow):
             "La vista de grilla descarga carátulas — puede usar más datos"
         )
         self.view_toggle_btn.clicked.connect(self._toggle_view_mode)
+        topbar_layout.addWidget(self.view_toggle_btn)
 
-        self.fav_btn = QPushButton("☆ Favorito")
-        self.fav_btn.clicked.connect(self._toggle_current_favorite)
+        # Íconos con desplegable: "en curso" (favorito) y descargas
+        self.fav_btn = QToolButton()
+        self.fav_btn.setObjectName("iconBtn")
+        self.fav_btn.setText("☆")
+        self.fav_btn.setToolTip("Marcar/desmarcar esta carpeta como favorita")
+        self.fav_btn.setPopupMode(QToolButton.InstantPopup)
+        self.fav_menu = QMenu(self.fav_btn)
+        self.fav_menu.aboutToShow.connect(self._rebuild_fav_menu)
+        self.fav_btn.setMenu(self.fav_menu)
+        topbar_layout.addWidget(self.fav_btn)
 
-        top_row.addWidget(self.back_btn)
-        top_row.addWidget(self.fwd_btn)
-        top_row.addWidget(self.refresh_btn)
-        top_row.addSpacing(10)
-        top_row.addWidget(self.breadcrumb, stretch=1)
-        top_row.addWidget(self.search_box)
-        top_row.addWidget(self.global_search_btn)
-        top_row.addWidget(self.view_toggle_btn)
-        top_row.addWidget(self.fav_btn)
-        main_layout.addLayout(top_row)
+        self.downloads_btn = QToolButton()
+        self.downloads_btn.setObjectName("iconBtn")
+        self.downloads_btn.setText("⬇")
+        self.downloads_btn.setToolTip("Descargas")
+        self.downloads_btn.setPopupMode(QToolButton.InstantPopup)
+        self.dl_menu = QMenu(self.downloads_btn)
+        self.dl_menu.aboutToShow.connect(self._rebuild_downloads_menu)
+        self.downloads_btn.setMenu(self.dl_menu)
+        topbar_layout.addWidget(self.downloads_btn)
+
+        root_layout.addWidget(topbar)
+
+        # --- Panel principal ----------------------------------------------
+        main_panel = QWidget()
+        main_layout = QVBoxLayout(main_panel)
+        main_layout.setContentsMargins(20, 12, 20, 16)
+        main_layout.setSpacing(10)
+
+        # Fila de navegación (atrás/adelante/refrescar + breadcrumb),
+        # visible sobre todo cuando estás explorando carpetas.
+        nav_row = QHBoxLayout()
+        self.back_btn = QToolButton()
+        self.back_btn.setText("◀")
+        self.back_btn.setToolTip("Atrás")
+        self.back_btn.clicked.connect(self.go_back)
+        self.fwd_btn = QToolButton()
+        self.fwd_btn.setText("▶")
+        self.fwd_btn.setToolTip("Adelante")
+        self.fwd_btn.clicked.connect(self.go_forward)
+        self.refresh_btn = QToolButton()
+        self.refresh_btn.setText("⟳")
+        self.refresh_btn.setToolTip("Refrescar")
+        self.refresh_btn.clicked.connect(self.refresh_current)
+
+        self.breadcrumb = QLabel("")
+        self.breadcrumb.setObjectName("breadcrumb")
+        self.breadcrumb.setWordWrap(True)
+
+        nav_row.addWidget(self.back_btn)
+        nav_row.addWidget(self.fwd_btn)
+        nav_row.addWidget(self.refresh_btn)
+        nav_row.addSpacing(10)
+        nav_row.addWidget(self.breadcrumb, stretch=1)
+        main_layout.addLayout(nav_row)
 
         self.status_label = QLabel("")
         self.status_label.setObjectName("statusLabel")
@@ -389,6 +402,13 @@ class MainWindow(QMainWindow):
         self.history_view.play_requested.connect(self._on_history_play_requested)
         self.history_view.remove_requested.connect(self._on_history_remove_requested)
         self.stack.addWidget(self.history_view)
+
+        # Pantalla de inicio estilo streaming: hero + filas horizontales
+        self.home_view = HomeView()
+        self.home_view.open_requested.connect(lambda url: self.navigate_to(url, push_history=True))
+        self.home_view.detail_requested.connect(lambda url: self.navigate_to(url, push_history=True))
+        self.home_view.play_requested.connect(self._on_home_play)
+        self.stack.addWidget(self.home_view)
 
         main_layout.addWidget(self.stack, stretch=1)
 
@@ -475,13 +495,24 @@ class MainWindow(QMainWindow):
             return False
         has_sinopsis = any(e.name.lower() == "sinopsis.txt" for e in entries if not e.is_dir)
         # Todo lo que esté dentro de una carpeta "Peliculas" o "Series"
-        # (con o sin tilde) se trata directamente con la vista de
-        # detalle, tenga o no sinopsis.txt — más confiable que depender
-        # de que todas las carpetas tengan ese archivo.
-        path_lower = urlparse(folder_url).path.lower()
-        under_peliculas = "/peliculas" in path_lower or "/películas" in path_lower
+        # (con o sin tilde, en cualquier nivel de la ruta) se trata
+        # directamente con la vista de detalle, tenga o no sinopsis.txt —
+        # más confiable que depender de que todas tengan ese archivo.
+        path_lower = unquote(urlparse(folder_url).path).lower().replace("í", "i")
+        under_peliculas = "/peliculas" in path_lower
         under_series = "/series" in path_lower
-        return has_sinopsis or under_peliculas or under_series
+        if has_sinopsis or under_peliculas or under_series:
+            return True
+        # Carpeta "hoja": tiene videos y ninguna subcarpeta propia de un
+        # nivel más de navegación (ignoramos carpetas técnicas típicas de
+        # releases). Esas son listados de episodios/película sueltos y se
+        # ven mucho mejor en la vista de detalle que como carpetas crudas.
+        IGNORED_DIRS = {"subs", "subtitles", "subtitulos", "subtítulos", "extras",
+                        "sample", "samples", "artwork", "backdrops", "posters"}
+        subdirs = [e for e in entries if e.is_dir and e.name.lower() not in IGNORED_DIRS]
+        if not subdirs:
+            return True
+        return False
 
     def _media_type_for_folder(self, folder_url: str) -> str:
         """"movie" o "tv" — decide qué endpoint de TMDb usar."""
@@ -512,24 +543,41 @@ class MainWindow(QMainWindow):
 
     def _show_movie_detail(self, entries: list[Entry], folder_url: str):
         video_entries = [e for e in entries if e.is_video]
-        title = _clean_title([p for p in urlparse(folder_url).path.split("/") if p][-1] if folder_url.strip("/") else "")
+        folder_name = [p for p in urlparse(folder_url).path.split("/") if p][-1] if folder_url.strip("/") else ""
+        title = clean_display_title(folder_name) or "Sin título"
 
         self._detail_media_type = self._media_type_for_folder(folder_url)
-        self.detail_view.reset(title or "Sin título")
+        self.detail_view.reset(title)
         # una búsqueda de TMDb de la carpeta anterior ya no aplica acá
         self._imdb_request_id += 1
-        size_bits = [e.size for e in video_entries if e.size]
-        meta_parts = [f"{len(video_entries)} archivo(s) de video"]
-        if len(video_entries) == 1 and video_entries[0].size:
-            meta_parts.append(video_entries[0].size)
-        self.detail_view.set_meta("  ·  ".join(meta_parts))
-        self.detail_view.set_videos([(e.url, e.name) for e in video_entries])
-        self.stack.setCurrentWidget(self.detail_view)
-
         self._detail_entries = entries
         self._detail_folder_url = folder_url
 
-        # Sinopsis (texto) en un hilo aparte
+        # Chips locales (sin red): año parseado del nombre + tamaño.
+        # Se completan con la ficha de TMDb si está cacheada o llega ahora.
+        chips: list[str] = []
+        year = parse_year(folder_name)
+        if year:
+            chips.append(year)
+        if len(video_entries) == 1 and video_entries[0].size:
+            chips.append(video_entries[0].size)
+        self.detail_view.set_chips(chips)
+
+        # Videos con nombres limpios (episodios "T1 · E5 …") y % visto
+        videos = []
+        for e in video_entries:
+            if self._detail_media_type == "tv":
+                label = episode_display(e.name)
+            else:
+                label = clean_display_title(e.name) or e.name
+            frac = self.progress.fraction(e.url)
+            if frac is not None:
+                label += "   ✓ visto" if frac >= 0.95 else f"   ▶ {int(frac * 100)}%"
+            videos.append((e.url, label))
+        self.detail_view.set_videos(videos)
+        self.stack.setCurrentWidget(self.detail_view)
+
+        # Sinopsis local (sinopsis.txt) en un hilo aparte
         sinopsis_entry = next((e for e in entries if e.name.lower() == "sinopsis.txt"), None)
         if sinopsis_entry:
             self._fetch_synopsis(sinopsis_entry.url)
@@ -541,6 +589,47 @@ class MainWindow(QMainWindow):
         # Carátula (heurística de imágenes dentro de la carpeta)
         self._detail_poster_key = folder_url + "#poster"
         self.thumbnails.request(self._detail_poster_key, in_folder_poster_candidates(entries))
+
+        # Backdrop panorámico: fanart local dentro de la carpeta, y si hay
+        # ficha cacheada de TMDb también su backdrop (el primero que
+        # llegue gana; thumbnails cachea cada key por separado).
+        backdrop_candidates = in_folder_backdrop_candidates(entries)
+        stored = self.meta_store.get(folder_url)
+        if stored:
+            if stored.backdrop_url:
+                backdrop_candidates.append(stored.backdrop_url)
+            self._apply_meta_to_detail(stored)
+        if backdrop_candidates:
+            self.thumbnails.request(folder_url + "#backdrop", backdrop_candidates)
+
+        # Ficha TMDb automática si hay API key y todavía no hay caché
+        if stored is None:
+            self._auto_fetch_tmdb(folder_url, title)
+
+    def _auto_fetch_tmdb(self, folder_url: str, displayed_title: str):
+        """Busca la ficha completa en TMDb sin mostrar diálogo — solo si
+        ya hay una API key configurada (no se pide acá)."""
+        api_key = self.config.get("tmdb_api_key")
+        if not api_key:
+            if not any(e.name.lower() == "sinopsis.txt" for e in self._detail_entries):
+                self.detail_view.set_synopsis(
+                    "Sin sinopsis local — tocá «Buscar ficha en TMDb» para "
+                    "configurar una API key gratuita y ver sinopsis, póster, "
+                    "géneros y rating."
+                )
+            return
+        search_title = self._search_title_for_detail(folder_url, displayed_title)
+        match = re.search(r"\((\d{4})\)\s*$", search_title)
+        year = match.group(1) if match else None
+        clean_title = re.sub(r"\s*\(\d{4}\)\s*$", "", search_title).strip()
+        self._imdb_request_id += 1
+        try:
+            self._io_executor.submit(
+                self._fetch_imdb_bg, api_key, clean_title, year,
+                self._detail_media_type, self._imdb_request_id, folder_url,
+            )
+        except RuntimeError:
+            pass  # la app se está cerrando
 
     def _fetch_synopsis(self, url: str):
         self._synopsis_request_id += 1
@@ -758,7 +847,8 @@ class MainWindow(QMainWindow):
             return
 
         displayed_title = self.detail_view.title_label.text()
-        search_title = self._search_title_for_detail(self._detail_folder_url or "", displayed_title)
+        folder_url = self._detail_folder_url or ""
+        search_title = self._search_title_for_detail(folder_url, displayed_title)
         # si el título tiene un año entre paréntesis, ej. "Interestelar (2014)",
         # lo separamos para que la búsqueda en TMDb sea más precisa
         match = re.search(r"\((\d{4})\)\s*$", search_title)
@@ -771,27 +861,27 @@ class MainWindow(QMainWindow):
         try:
             self._io_executor.submit(
                 self._fetch_imdb_bg, api_key, clean_title, year,
-                self._detail_media_type, self._imdb_request_id,
+                self._detail_media_type, self._imdb_request_id, folder_url,
             )
         except RuntimeError:
             pass
 
-    def _fetch_imdb_bg(self, api_key: str, title: str, year: str | None, media_type: str, request_id: int):
-        plot, poster_url, error = tmdb.fetch_synopsis(api_key, title, year, language="es-ES", media_type=media_type)
-        self._imdb_ready_signal.emit(plot, poster_url or "", error, request_id)
+    def _fetch_imdb_bg(self, api_key: str, title: str, year: str | None,
+                       media_type: str, request_id: int, folder_url: str):
+        info, error = tmdb.fetch_media_info(api_key, title, year, language="es-ES", media_type=media_type)
+        self._imdb_ready_signal.emit(info if not error else None, error, folder_url, request_id)
 
-    def _on_imdb_ready(self, plot: str, poster_url: str, error: str, request_id: int = -1):
+    def _on_imdb_ready(self, info: dict | None, error: str, folder_url: str, request_id: int = -1):
         if request_id != -1 and request_id != self._imdb_request_id:
             return
-        if self.stack.currentWidget() is not self.detail_view:
-            return
         if error:
-            self.detail_view.set_synopsis(f"TMDb: {error}")
+            if self.stack.currentWidget() is self.detail_view and folder_url == self._detail_folder_url:
+                self.detail_view.set_synopsis(f"TMDb: {error}")
             return
-        self.detail_view.set_synopsis(plot)
-        # si no hay carátula local, probamos con el póster que trajo TMDb
-        if poster_url and self._detail_poster_key:
-            self.thumbnails.request(self._detail_poster_key + "#imdb", [poster_url])
+        if info:
+            # _on_meta_ready guarda en caché, actualiza el home y aplica
+            # a la vista de detalle si sigue abierta esta carpeta
+            self._meta_ready_signal.emit(folder_url, meta_from_tmdb_info(info))
 
     def _on_online_subtitles_requested(self):
         api_key = self._ensure_api_key(
@@ -905,14 +995,14 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 pass
 
-    def _fetch_history_cover_bg(self, video_url: str):
+    def _fetch_history_cover_bg(self, video_url: str, suffix: str = "#historycover"):
         folder_url = video_url.rsplit("/", 1)[0] + "/"
         listing = self.client.list_dir(folder_url)  # cacheado, no siempre pega a la red
         if listing.error:
             return
         candidates = in_folder_poster_candidates(listing.entries)
         if candidates:
-            self.thumbnails.request(video_url + "#historycover", candidates)
+            self.thumbnails.request(video_url + suffix, candidates)
 
     def _on_history_play_requested(self, video_url: str, title: str, position: float):
         # No hacer red acá: esto corre en el hilo de la GUI y un listado
@@ -945,6 +1035,273 @@ class MainWindow(QMainWindow):
     def _on_history_remove_requested(self, video_url: str):
         self.progress.remove(video_url)
         self.history_view.remove_item(video_url)
+
+    # ------------------------------------------------------------------
+    # Home (pantalla inicial estilo plataforma de streaming)
+    # ------------------------------------------------------------------
+    def _show_home(self):
+        self.stack.setCurrentWidget(self.home_view)
+        self.close_player_btn.hide()
+        self.current_url = None
+        self.breadcrumb.setText("Inicio")
+        self._update_fav_button()
+        # Refresca si nunca se cargó o si los datos son viejos (el
+        # contenido del servidor puede haber cambiado).
+        if not self._home_built_at or (time.time() - self._home_built_at) > HOME_STALE_SECONDS:
+            self._refresh_home()
+
+    def _refresh_home(self):
+        self.home_view.show_loading("Cargando catálogo…")
+        self.status_label.setText("Cargando portada…")
+        try:
+            self._io_executor.submit(self._load_home_bg)
+        except RuntimeError:
+            pass  # la app se está cerrando
+
+    def _load_home_bg(self):
+        """Corre en background: arma las filas del home a partir de las
+        carpetas de categorías + progreso + favoritos, y emite la
+        estructura completa de una."""
+        rows: list[tuple[str, str, list[CardData]]] = []
+        recent_pool: list[tuple[float, Entry]] = []
+        series_cards: list[CardData] = []
+        movie_cards: list[CardData] = []
+
+        row_titles = {
+            "movies": "Películas",
+            "series": "Series",
+            "kids": "Infantiles",
+        }
+        folder_keys = {
+            "peliculas": "movies", "películas": "movies",
+            "series": "series",
+            "infantiles": "kids",
+        }
+        for _label, folder in CATEGORY_SHORTCUTS:
+            url = BASE_URL + folder + "/"
+            listing = self.client.list_dir(url)
+            if listing.error:
+                continue
+            entries = [e for e in listing.entries if e.is_dir or e.is_video]
+            cards = [self._card_for_entry(e) for e in entries[:24]]
+            if not cards:
+                continue
+            key = folder_keys.get(folder.lower(), folder.lower())
+            rows.append((key, row_titles.get(key, folder), cards))
+            for e in entries:
+                stamp = self._parse_entry_date(e.date)
+                if stamp:
+                    recent_pool.append((stamp, e))
+            if key == "series":
+                series_cards = cards
+            elif key == "movies":
+                movie_cards = cards
+
+        # --- Continuar viendo (desde el progreso local) ---
+        continue_cards = []
+        for item in self.progress.list_in_progress():
+            title = clean_display_title(item.get("title") or "") or item.get("title") or "(sin título)"
+            continue_cards.append(CardData(
+                key=item["url"], title=title, url=item["url"], is_video=True,
+                meta=f"▶ {int(item['fraction'] * 100)}% visto",
+                progress=item["fraction"],
+                payload={"position": item["position"]},
+            ))
+        if continue_cards:
+            rows.insert(0, ("continue", "Continuar viendo", continue_cards))
+
+        # --- Agregados recientemente (fecha del listado de Apache) ---
+        recent_pool.sort(key=lambda pair: pair[0], reverse=True)
+        seen_urls = {c.url for _k, _t, cards in rows for c in cards}
+        recent_cards = [
+            self._card_for_entry(e) for _stamp, e in recent_pool[:16] if e.url not in seen_urls
+        ]
+        if recent_cards:
+            rows.append(("recent", "Agregados recientemente", recent_cards))
+
+        # --- Favoritos ---
+        fav_cards = []
+        for fav in self.favorites[:16]:
+            fav_cards.append(CardData(
+                key=fav["url"], title=_clean_title(fav["name"]), url=fav["url"],
+            ))
+        if fav_cards:
+            rows.append(("favorites", "Tus favoritos", fav_cards))
+
+        # --- Hero: preferimos títulos con backdrop panorámico conocido ---
+        hero_pool = movie_cards + series_cards
+        with_backdrop = [c for c in hero_pool
+                         if (self.meta_store.get(c.url) or MediaMeta()).backdrop_url]
+        with_urls = {c.url for c in with_backdrop}
+        without_backdrop = [c for c in hero_pool if c.url not in with_urls]
+        hero = []
+        for card in (with_backdrop + without_backdrop)[:6]:
+            stored = self.meta_store.get(card.url)
+            meta_bits = []
+            if stored:
+                if stored.title:
+                    card.title = stored.title
+                meta_bits = stored.chips()[:3]
+            elif card.meta:
+                meta_bits = [card.meta]
+            card.meta = "  ·  ".join(meta_bits)
+            card.payload = {"synopsis": (stored.overview[:180] + "…") if stored and stored.overview else ""}
+            hero.append(card)
+
+        self._home_ready_signal.emit({"rows": rows, "hero": hero})
+
+    def _card_for_entry(self, entry: Entry) -> CardData:
+        """CardData de una entrada del listado, usando el caché de
+        metadatos si ya hay ficha de TMDb para esa carpeta."""
+        title = clean_display_title(entry.name) or entry.name
+        meta = ""
+        stored = self.meta_store.get(entry.url)
+        if stored:
+            if stored.title:
+                title = stored.title
+            meta = "  ·  ".join(stored.chips()[:2])
+        elif parse_year(entry.name):
+            meta = parse_year(entry.name) or ""
+        return CardData(key=entry.url, title=title, url=entry.url,
+                        is_video=entry.is_video, meta=meta)
+
+    @staticmethod
+    def _parse_entry_date(date_str: str) -> float:
+        """Fecha del listado de Apache ("2024-01-05 12:30" o
+        "05-Jan-24 12:30") -> timestamp, o 0 si no se pudo parsear."""
+        date_str = (date_str or "").strip()
+        for fmt in ("%Y-%m-%d %H:%M", "%d-%b-%Y %H:%M", "%d-%b-%y %H:%M", "%Y-%m-%d"):
+            try:
+                return time.mktime(time.strptime(date_str, fmt))
+            except ValueError:
+                continue
+        return 0.0
+
+    def _on_home_ready(self, structure: dict):
+        self.home_view.set_structure(structure["rows"], structure["hero"])
+        self._home_built_at = time.time()
+        self.status_label.setText("")
+
+        # Pósters de todas las tarjetas (las carpetas resuelven solas con
+        # los nombres típicos de Kodi; los videos necesitan listar su
+        # carpeta para buscar la imagen hermana).
+        requested: set[str] = set()
+        for _key, _title, cards in structure["rows"]:
+            for card in cards:
+                self._request_card_image(card, requested)
+        for card in structure["hero"]:
+            self._request_card_image(card, requested)
+            stored = self.meta_store.get(card.url)
+            if stored and stored.backdrop_url:
+                self.thumbnails.request(card.url + "#backdrop", [stored.backdrop_url])
+
+        self._start_home_enrichment(structure)
+
+    def _request_card_image(self, card: CardData, requested: set[str]):
+        if card.url in requested:
+            return
+        requested.add(card.url)
+        if card.is_video:
+            try:
+                self._io_executor.submit(self._fetch_card_cover_bg, card.url)
+            except RuntimeError:
+                pass
+            return
+        entry = Entry(name=unquote(card.url.rstrip("/").rsplit("/", 1)[-1]),
+                      url=card.url, is_dir=True)
+        self.thumbnails.request(card.url + "#card", candidate_urls_for(entry, []))
+
+    def _fetch_card_cover_bg(self, video_url: str):
+        """Póster de un video suelto (ej. fila 'Continuar viendo'):
+        busca imágenes hermanas en su carpeta."""
+        folder_url = video_url.rsplit("/", 1)[0] + "/"
+        listing = self.client.list_dir(folder_url)
+        if listing.error:
+            return
+        entry = next((e for e in listing.entries if e.url == video_url), None)
+        candidates = candidate_urls_for(entry, listing.entries) if entry else []
+        if not candidates:
+            candidates = in_folder_poster_candidates(listing.entries)
+        if candidates:
+            self.thumbnails.request(video_url + "#card", candidates)
+
+    def _on_home_play(self, card: CardData):
+        """Reproducción pedida desde una tarjeta del home."""
+        if not card.is_video:
+            # es una carpeta (película/serie): la ruta natural es la vista
+            # de detalle, donde está el botón de reproducir grande
+            self.navigate_to(card.url, push_history=True)
+            return
+        position = 0.0
+        if isinstance(card.payload, dict):
+            position = float(card.payload.get("position") or 0)
+        if position > 0:
+            self._open_player(card.url, card.title, start_at=position, subtitle_urls=[])
+            try:
+                self._io_executor.submit(self._load_history_subs_bg, card.url)
+            except RuntimeError:
+                pass
+        else:
+            self._open_player_with_resume(card.url, card.title, subtitle_urls=[])
+
+    # --- Enriquecimiento de metadatos vía TMDb (opcional) ---------------
+    def _start_home_enrichment(self, structure: dict):
+        """Si hay API key de TMDb configurada, busca la ficha completa de
+        las carpetas que todavía no están en el caché (en background, con
+        cortesía ante el rate limit). Los resultados se aplican solos a
+        medida que llegan vía _meta_ready_signal."""
+        api_key = self.config.get("tmdb_api_key")
+        if not api_key:
+            return
+        targets: list[CardData] = []
+        seen: set[str] = set()
+        pool = list(structure["hero"]) + [c for _k, _t, cards in structure["rows"] for c in cards]
+        for card in pool:
+            if card.is_video or card.url in seen or self.meta_store.has(card.url):
+                continue
+            seen.add(card.url)
+            targets.append(card)
+        if not targets:
+            return
+        try:
+            self._io_executor.submit(self._enrich_home_bg, api_key,
+                                     [(c.url, c.title) for c in targets[:40]])
+        except RuntimeError:
+            pass
+
+    def _enrich_home_bg(self, api_key: str, targets: list[tuple[str, str]]):
+        for url, title in targets:
+            media_type = "tv" if "/series" in urlparse(url).path.lower() else "movie"
+            year = parse_year(title)
+            clean = re.sub(r"\s*\(\d{4}\)\s*$", "", title).strip()
+            info, _error = tmdb.fetch_media_info(
+                api_key, clean, year, language="es-ES", media_type=media_type,
+            )
+            if info:
+                self._meta_ready_signal.emit(url, meta_from_tmdb_info(info))
+            time.sleep(0.3)  # cortesía con el rate limit de TMDb
+
+    def _on_meta_ready(self, folder_url: str, meta: MediaMeta):
+        """Ficha de TMDb llegada (del enriquecimiento del home o del
+        detalle): guarda en el caché y aplica a lo que esté visible."""
+        self.meta_store.put(folder_url, meta)
+        self.home_view.update_card_meta(
+            folder_url,
+            title=meta.title or None,
+            meta="  ·  ".join(meta.chips()[:2]),
+        )
+        if meta.backdrop_url:
+            self.thumbnails.request(folder_url + "#backdrop", [meta.backdrop_url])
+        if (self.stack.currentWidget() is self.detail_view
+                and self._detail_folder_url == folder_url):
+            self._apply_meta_to_detail(meta)
+
+    def _apply_meta_to_detail(self, meta: MediaMeta):
+        self.detail_view.set_chips(meta.chips())
+        if meta.overview:
+            self.detail_view.set_synopsis(meta.overview)
+        if meta.poster_url and self._detail_poster_key:
+            self.thumbnails.request(self._detail_poster_key + "#tmdb", [meta.poster_url])
 
     # ------------------------------------------------------------------
     # Listado: modo lista / modo grilla con carátulas
@@ -999,7 +1356,7 @@ class MainWindow(QMainWindow):
             self.file_list.addItem(item)
 
     def _grid_caption(self, entry: Entry) -> str:
-        name = entry.name
+        name = clean_display_title(entry.name) or entry.name
         if len(name) > 26:
             name = name[:24] + "…"
         return f"{name}{self._progress_tag(entry)}"
@@ -1021,8 +1378,12 @@ class MainWindow(QMainWindow):
             return
 
         # ¿Es la carátula de la vista de detalle actual? (incluye el
-        # póster alternativo que puede venir de IMDb/OMDb)
-        if self._detail_poster_key and key in (self._detail_poster_key, self._detail_poster_key + "#imdb"):
+        # póster alternativo que puede venir de TMDb)
+        if self._detail_poster_key and key in (
+            self._detail_poster_key,
+            self._detail_poster_key + "#imdb",
+            self._detail_poster_key + "#tmdb",
+        ):
             pix = QPixmap()
             if pix.loadFromData(data):
                 scaled = pix.scaled(
@@ -1030,6 +1391,32 @@ class MainWindow(QMainWindow):
                     Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation,
                 )
                 self.detail_view.set_poster_pixmap(scaled)
+            return
+
+        # ¿Es un póster de tarjeta del home?
+        if key.endswith("#card"):
+            pix = QPixmap()
+            if pix.loadFromData(data):
+                scaled = pix.scaled(
+                    CARD_POSTER_SIZE[0], CARD_POSTER_SIZE[1],
+                    Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation,
+                )
+                self.home_view.set_poster(key[: -len("#card")], scaled)
+            return
+
+        # ¿Es un backdrop panorámico (hero del home o vista de detalle)?
+        if key.endswith("#backdrop"):
+            base = key[: -len("#backdrop")]
+            pix = QPixmap()
+            if pix.loadFromData(data):
+                scaled = pix.scaled(
+                    BACKDROP_SIZE, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation,
+                )
+                if (self.stack.currentWidget() is self.detail_view
+                        and base == self._detail_folder_url):
+                    self.detail_view.set_backdrop_pixmap(scaled)
+                else:
+                    self.home_view.set_backdrop(base, scaled)
             return
 
         # ¿Es la carátula de un ítem del Historial?
@@ -1194,7 +1581,13 @@ class MainWindow(QMainWindow):
     def _close_player(self):
         self._save_current_progress()
         self.player.stop()
-        self.stack.setCurrentWidget(self.file_list)
+        # Si el video se abrió desde el home (sin navegar a su carpeta),
+        # volvemos al home en vez de un listado ajeno.
+        if self.current_url is None:
+            self.stack.setCurrentWidget(self.home_view)
+            self._show_home()
+        else:
+            self.stack.setCurrentWidget(self.file_list)
         self.close_player_btn.hide()
         # refresca los porcentajes en la lista al volver
         self._populate_list(self.current_entries)
@@ -1216,10 +1609,70 @@ class MainWindow(QMainWindow):
     def _start_download(self, entry: Entry, relative_dir: str = ""):
         task_id = self.downloads.enqueue(entry.url, entry.name, relative_dir=relative_dir)
         label = f"{relative_dir}/{entry.name}" if relative_dir else entry.name
-        item = QListWidgetItem(f"⬇ {label}  —  en cola")
-        item.setData(Qt.UserRole, task_id)
-        self.downloads_list.addItem(item)
-        self._download_items[task_id] = item
+        self._download_labels[task_id] = f"⬇ {label}  —  en cola"
+        self._update_downloads_badge()
+
+    def _update_downloads_badge(self):
+        active = sum(
+            1 for t in self._download_labels
+            if (self.downloads.tasks.get(t) and
+                self.downloads.tasks[t].status in ("queued", "downloading"))
+        )
+        self.downloads_btn.setText(f"⬇ {active}" if active else "⬇")
+
+    def _on_download_progress(self, task_id: str, done: int, total: int):
+        if task_id not in self._download_labels:
+            return
+        task = self.downloads.tasks.get(task_id)
+        name = task.filename if task else "archivo"
+        if total:
+            pct = int(done / total * 100)
+            mb_done, mb_total = done / 1_048_576, total / 1_048_576
+            self._download_labels[task_id] = f"⬇ {name}  —  {pct}%  ({mb_done:.0f} / {mb_total:.0f} MB)"
+        else:
+            self._download_labels[task_id] = f"⬇ {name}  —  {done / 1_048_576:.0f} MB"
+
+    def _on_download_status(self, task_id: str, status: str):
+        task = self.downloads.tasks.get(task_id)
+        name = task.filename if task else "archivo"
+        if status == "queued":
+            self._download_labels[task_id] = f"⬇ {name}  —  en cola"
+        elif status == "downloading":
+            self._download_labels[task_id] = f"⬇ {name}  —  descargando…"
+        elif status == "completed":
+            self._download_labels[task_id] = f"✅ {name}  —  completado"
+        elif status == "canceled":
+            self._download_labels[task_id] = f"⛔ {name}  —  cancelado"
+        elif status.startswith("error"):
+            self._download_labels[task_id] = f"⚠️ {name}  —  error al descargar"
+        self._update_downloads_badge()
+
+    def _rebuild_downloads_menu(self):
+        self.dl_menu.clear()
+        self.dl_menu.addAction("📂  Abrir carpeta de descargas", self._open_downloads_folder)
+        self.dl_menu.addSeparator()
+        if not self._download_labels:
+            act = self.dl_menu.addAction("(sin descargas)")
+            act.setEnabled(False)
+            return
+        for task_id, label in list(self._download_labels.items()):
+            task = self.downloads.tasks.get(task_id)
+            if not task:
+                continue
+            sub = self.dl_menu.addMenu(label)
+            if task.status in ("queued", "downloading"):
+                sub.addAction("Cancelar", lambda t=task_id: self.downloads.cancel(t))
+            if task.status == "completed":
+                sub.addAction("Mostrar en Finder", lambda p=task.dest_path: self._reveal_in_finder(p))
+        self.dl_menu.addSeparator()
+        self.dl_menu.addAction("🧹  Limpiar completadas", self._clear_finished_downloads)
+
+    def _clear_finished_downloads(self):
+        for task_id in list(self._download_labels):
+            task = self.downloads.tasks.get(task_id)
+            if task and task.status in ("completed", "canceled") or (task and task.status.startswith("error")):
+                self._download_labels.pop(task_id, None)
+        self._update_downloads_badge()
 
     # ------------------------------------------------------------------
     # Descargar una carpeta completa (recursivo, con subcarpetas)
@@ -1280,51 +1733,6 @@ class MainWindow(QMainWindow):
             fake_entry = Entry(name=filename, url=url, is_dir=False)
             self._start_download(fake_entry, relative_dir=relative_dir)
 
-    def _on_download_progress(self, task_id: str, done: int, total: int):
-        item = self._download_items.get(task_id)
-        if not item:
-            return
-        task = self.downloads.tasks.get(task_id)
-        name = task.filename if task else "archivo"
-        if total:
-            pct = int(done / total * 100)
-            mb_done, mb_total = done / 1_048_576, total / 1_048_576
-            item.setText(f"⬇ {name}\n   {pct}%  ({mb_done:.0f} / {mb_total:.0f} MB)")
-        else:
-            item.setText(f"⬇ {name}\n   {done / 1_048_576:.0f} MB descargados")
-
-    def _on_download_status(self, task_id: str, status: str):
-        item = self._download_items.get(task_id)
-        if not item:
-            return
-        task = self.downloads.tasks.get(task_id)
-        name = task.filename if task else "archivo"
-        if status == "queued":
-            item.setText(f"⬇ {name}\n   en cola")
-        elif status == "downloading":
-            item.setText(f"⬇ {name}\n   descargando…")
-        elif status == "completed":
-            item.setText(f"✅ {name}\n   completado")
-        elif status == "canceled":
-            item.setText(f"⛔ {name}\n   cancelado")
-        elif status.startswith("error"):
-            item.setText(f"⚠️ {name}\n   error al descargar")
-
-    def _show_downloads_menu(self, pos):
-        item = self.downloads_list.itemAt(pos)
-        if not item:
-            return
-        task_id = item.data(Qt.UserRole)
-        task = self.downloads.tasks.get(task_id)
-        if not task:
-            return
-        menu = QMenu(self)
-        if task.status in ("queued", "downloading"):
-            menu.addAction("Cancelar", lambda: self.downloads.cancel(task_id))
-        if task.status == "completed":
-            menu.addAction("Mostrar en Finder", lambda: self._reveal_in_finder(task.dest_path))
-        menu.exec(self.downloads_list.viewport().mapToGlobal(pos))
-
     def _reveal_in_finder(self, path: Path):
         import subprocess
         subprocess.run(["open", "-R", str(path)])
@@ -1348,14 +1756,22 @@ class MainWindow(QMainWindow):
     def _save_favorites(self):
         FAVORITES_FILE.write_text(json.dumps(self.favorites, ensure_ascii=False, indent=2))
 
-    def _refresh_fav_list(self):
-        self.fav_list.clear()
-        for fav in self.favorites:
-            # unquote acá también, por si el favorito se guardó con el
-            # bug viejo (nombre sin decodificar) antes de este arreglo
-            item = QListWidgetItem(f"★ {_clean_title(fav['name'])}")
-            item.setData(Qt.UserRole, fav["url"])
-            self.fav_list.addItem(item)
+    def _rebuild_fav_menu(self):
+        self.fav_menu.clear()
+        if not self.favorites:
+            act = self.fav_menu.addAction("(sin favoritos todavía)")
+            act.setEnabled(False)
+        else:
+            for fav in self.favorites:
+                # unquote acá también, por si el favorito se guardó con el
+                # bug viejo (nombre sin decodificar) antes de este arreglo
+                label = f"★ {_clean_title(fav['name'])}"
+                url = fav["url"]
+                self.fav_menu.addAction(label, lambda u=url: self.navigate_to(u, push_history=True))
+        self.fav_menu.addSeparator()
+        self.fav_menu.addAction(
+            "☆ Marcar/desmarcar carpeta actual", self._toggle_current_favorite
+        )
 
     def _toggle_current_favorite(self):
         url = self.current_url
@@ -1369,16 +1785,11 @@ class MainWindow(QMainWindow):
             label = _clean_title(name[-1]) if name else "Inicio"
             self.favorites.append({"name": label, "url": url})
         self._save_favorites()
-        self._refresh_fav_list()
         self._update_fav_button()
 
     def _update_fav_button(self):
         is_fav = any(f["url"] == self.current_url for f in self.favorites)
-        self.fav_btn.setText("★ Favorito" if is_fav else "☆ Favorito")
-
-    def _open_favorite(self, item: QListWidgetItem):
-        url = item.data(Qt.UserRole)
-        self.navigate_to(url, push_history=True)
+        self.fav_btn.setText("★" if is_fav else "☆")
 
     # ------------------------------------------------------------------
     def closeEvent(self, event):

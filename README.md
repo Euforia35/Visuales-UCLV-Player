@@ -28,16 +28,20 @@ de Python — solo el programa `mpv` (el mismo que instala
 
 ## Forma más fácil de correrla: `run.sh`
 
-Este script instala TODO lo que falte (Homebrew, mpv, entorno virtual
-de Python, dependencias) y después abre la app. Es seguro correrlo
-todas las veces: si ya está todo instalado, simplemente lo detecta y
-salta directo a abrir la app.
+Este script instala TODO lo que falte (Homebrew, mpv, Python y las
+dependencias) y después abre la app. Es seguro correrlo todas las
+veces: si ya está todo instalado, simplemente lo detecta y salta
+directo a abrir la app.
 
 ```bash
-cd VisualesUCLV
+cd ~/VisualesUCLV
 chmod +x run.sh      # solo hace falta la primera vez
 ./run.sh
 ```
+
+Por defecto usa el Python de Miniconda (`/opt/miniconda3/bin/python`),
+que ya trae las dependencias. Si tenés otro entorno preparado, pasalo con
+`PYTHON_BIN=/ruta/a/python ./run.sh`.
 
 La primera vez puede tardar unos minutos (instala mpv vía Homebrew).
 Las siguientes veces arranca en segundos.
@@ -50,9 +54,7 @@ Las siguientes veces arranca en segundos.
 
 ```bash
 brew install mpv
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+python3 -m pip install -r requirements.txt
 python3 main.py
 ```
 
@@ -75,14 +77,17 @@ python3 main.py
   "📁 Ver todos los archivos" (útil para ver subtítulos sueltos, extras,
   etc.). Doble clic directo en un archivo de video reproduce.
 - Clic derecho sobre un archivo → reproducir, descargar, u olvidar progreso.
-- Botón ☆ arriba a la derecha → marca la carpeta actual como favorita
-  (aparece en el sidebar).
+- La navegación principal está en la **barra superior**: el menú
+  **"Explorar ▾"** reúne Inicio, Historial y las categorías (Películas,
+  Series, Infantiles), así el contenido aprovecha todo el ancho.
+- Botón ☆ arriba a la derecha → marca la carpeta actual como favorita y
+  despliega la lista de favoritos para ir directo a ellos.
 - Botón "🖼 Vista grilla" → cambia el listado de archivos (no la vista
   de detalle) a una grilla con carátulas. Como descarga imágenes, si tu
   conexión es lenta o costosa conviene dejarlo en vista de lista.
-- Las descargas aparecen en el sidebar con su progreso; clic derecho
-  para cancelar o "Mostrar en Finder" cuando terminan. Se guardan en
-  `~/Downloads/VisualesUCLV/`.
+- El botón ⬇ (con contador) muestra las descargas en curso y su
+  progreso; clic en una para cancelarla o abrirla en el Finder cuando
+  termina. Se guardan en `~/Downloads/VisualesUCLV/`.
 - Clic derecho sobre una carpeta → "⬇ Descargar toda esta carpeta"
   descarga TODO lo que hay adentro (recursivo, con subcarpetas
   incluidas), respetando esa misma estructura de carpetas al guardar.
@@ -142,14 +147,13 @@ Cada vez que te paso un zip nuevo:
 cd ~/VisualesUCLV                                  # tu carpeta del proyecto
 unzip -o ~/Downloads/VisualesUCLV.zip -d ~/Downloads
 cp -r ~/Downloads/VisualesUCLV/* .
-source venv/bin/activate
-pip install -r requirements.txt                     # solo instala lo que falte/cambió
+python3 -m pip install -r requirements.txt           # solo instala lo que falte/cambió
 python3 main.py                                      # probala antes de regenerar la app
 ```
 
 Fijate la versión actual en el archivo `VERSION` (o en `CHANGELOG.md`
 para ver qué cambió). Después de probarla, regenerá el `.app` liviano
-del Escritorio:
+(en `~/Applications`):
 
 ```bash
 ./build_app.sh
@@ -157,17 +161,23 @@ del Escritorio:
 
 ## Generar una app de doble clic (sin volver a tocar la Terminal)
 
-Una vez que ya corriste `./run.sh` al menos una vez (o instalaste todo a
-mano) y la app te abrió bien, generá el `.app` de doble clic:
+Una vez que la app te abrió bien (con `./run.sh` o a mano), generá el
+`.app` de doble clic:
 
 ```bash
 chmod +x build_app.sh
 ./build_app.sh
 ```
 
-Esto crea **"Visuales UCLV.app" en tu Escritorio**, con ícono propio
+Esto crea **"Visuales UCLV.app" en `~/Applications`**, con ícono propio
 (un triángulo de play rojo sobre fondo oscuro). De ahí en adelante,
 doble clic para abrir — no hace falta Terminal ni Python a la vista.
+
+> Por qué `~/Applications` y no el Escritorio: macOS protege
+> Escritorio, Documentos y Descargas, y puede bloquear **en silencio**
+> (sin diálogo) el acceso de apps sin firmar a esas carpetas. Fuera de
+> ellas, la app funciona sin sorpresas. Si querés cambiarlo, usá
+> `VISUALES_APP_DIR=/otra/ruta ./build_app.sh`.
 
 > La primera vez que la abras, macOS puede mostrar una advertencia de
 > "desarrollador no identificado" (normal para apps no firmadas). Si
@@ -175,13 +185,13 @@ doble clic para abrir — no hace falta Terminal ni Python a la vista.
 > las próximas veces abre directo con doble clic.
 
 > Si más adelante movés o renombrás la carpeta del proyecto
-> (`VisualesUCLV`), la app del Escritorio deja de encontrarla — volvé a
-> correr `./build_app.sh` para regenerarla apuntando a la nueva ubicación.
+> (`VisualesUCLV`), la app deja de encontrarla — volvé a correr
+> `./build_app.sh` para regenerarla apuntando a la nueva ubicación.
 
 **Importante:** esta app de doble clic sigue dependiendo de la carpeta
-del proyecto y su `venv` (solo te ahorra la Terminal en tu propia Mac).
-Para llevarla a OTRA computadora sin Python instalado, usá el `.dmg`
-de la siguiente sección.
+del proyecto y del Python que tiene las dependencias (solo te ahorra la
+Terminal en tu propia Mac). Para llevarla a OTRA computadora sin Python
+instalado, usá el `.dmg` de la siguiente sección.
 
 ## Llevarla a otra Mac sin Python instalado (.dmg)
 
@@ -207,26 +217,32 @@ Applications, como cualquier instalador de Mac.
 > bundle. Es un solo comando, mucho más liviano que pedirle a alguien
 > que instale Python + todo lo demás.
 
-> **Aviso honesto:** no tengo forma de probar `py2app` ni `hdiutil`
-> desde donde te escribo (son herramientas exclusivas de macOS). El
-> script está armado con la sintaxis correcta y buenas prácticas, pero
-> `py2app` + PySide6 a veces necesita algún ajuste puntual según la
-> versión exacta de macOS/Python — si te tira algún error al correrlo,
-> mandame el mensaje completo y lo resolvemos.
+> **Aviso honesto:** no tengo forma de probar `hdiutil` ni el armado
+> final del `.dmg` desde donde te escribo (son herramientas exclusivas
+> de macOS). El empaquetado con `py2app` sí se apoya en `setup.py`, que
+> está en el repo; si algo falla al correrlo, mandame el mensaje
+> completo y lo resolvemos.
 
 ## Estructura del proyecto
 
 ```
 run.sh              → arranque con auto-instalación de todo
 main.py             → punto de entrada
+theme.py            → tokens de diseño + generación del QSS (tema oscuro)
 apache_index.py     → parser del listado "Index of /..." de Apache
 player.py           → reproductor embebido con mpv + controles
 progress.py         → guarda el punto de reproducción (resume)
-thumbnails.py        → busca/descarga carátulas para la vista de grilla
+thumbnails.py        → busca/descarga carátulas/backdrops (cache en disco)
 downloads.py         → gestor de descargas en segundo plano
 main_window.py       → ventana principal: navegación, favoritos, grilla,
-                       descargas, menús contextuales
-style.qss            → tema visual oscuro
+                       descargas, menús contextuales, home y metadatos
+naming.py            → nombres de archivo crudos → títulos legibles
+metadata.py          → caché local de metadatos (TMDb + heurística)
+tmdb.py              → ficha completa en TMDb (sinopsis, póster, backdrop,
+                       año, duración, géneros, rating)
+cards.py             → tarjetas y filas horizontales estilo streaming
+home_view.py         → pantalla de inicio: hero + filas
+movie_detail.py      → vista de detalle con backdrop y chips
 setup.py             → empaquetado con py2app
 ```
 

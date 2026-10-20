@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 #
 # build_app.sh — genera "Visuales UCLV.app", una app de doble clic que
-# arranca el proyecto usando el entorno virtual ya armado (venv +
-# dependencias + mpv). No empaqueta Python ni las librerías dentro del
-# .app: simplemente lo lanza, así que evita los dolores de cabeza
-# típicos de py2app con PySide6 + mpv.
+# arranca el proyecto usando el intérprete de Python que ya tiene las
+# dependencias (por defecto el de Miniconda) + mpv. No empaqueta Python
+# ni las librerías dentro del .app: simplemente lo lanza, así que evita
+# los dolores de cabeza típicos de py2app con PySide6 + mpv.
 #
 # Uso (una sola vez, desde la carpeta del proyecto):
 #   chmod +x build_app.sh
 #   ./build_app.sh
 #
-# Esto crea "Visuales UCLV.app" en el Escritorio. Doble clic para abrir
-# de ahí en adelante — no hace falta volver a tocar la Terminal.
+# Esto crea "Visuales UCLV.app" en ~/Applications (NO en el Escritorio:
+# macOS protege Escritorio/Documentos/Descargas y puede bloquear en
+# silencio las apps sin firmar que corren desde ahí). Doble clic para
+# abrir de ahí en adelante — no hace falta volver a tocar la Terminal.
 #
 # Importante: el .app queda apuntando a la carpeta del proyecto en la
 # ubicación donde está AHORA MISMO. Si más adelante movés o renombrás
@@ -20,18 +22,30 @@
 set -euo pipefail
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_NAME="Visuales UCLV"
-APP_PATH="$HOME/Desktop/${APP_NAME}.app"
+APP_DIR="${VISUALES_APP_DIR:-$HOME/Applications}"
+APP_PATH="$APP_DIR/${APP_NAME}.app"
 
-case "$PROJECT_DIR" in
+# Intérprete de Python con las dependencias instaladas. Se puede
+# sobreescribir con PYTHON_BIN=… si tenés otro entorno preparado.
+PYTHON_BIN="${PYTHON_BIN:-/opt/miniconda3/bin/python}"
+if [[ ! -x "$PYTHON_BIN" ]]; then
+    PYTHON_BIN="$(command -v python3 || true)"
+fi
+if [[ -z "$PYTHON_BIN" || ! -x "$PYTHON_BIN" ]]; then
+    echo "⚠ No encuentro un intérprete de Python3. Instalá Miniconda o pasá PYTHON_BIN=/ruta/a/python."
+    exit 1
+fi
+if ! "$PYTHON_BIN" -c "import PySide6" >/dev/null 2>&1; then
+    echo "⚠ El intérprete $PYTHON_BIN no tiene PySide6 instalado."
+    echo "  Instalá las dependencias: $PYTHON_BIN -m pip install -r requirements.txt"
+    exit 1
+fi
+
+case "$APP_DIR" in
     "$HOME/Desktop"*|"$HOME/Documents"*|"$HOME/Downloads"*)
-        echo "⚠ AVISO IMPORTANTE:"
-        echo "  El proyecto está dentro de Escritorio, Documentos o Descargas."
-        echo "  macOS a veces bloquea en silencio (\"Operation not permitted\")"
-        echo "  el acceso de apps sin firmar a esas carpetas protegidas."
-        echo ""
-        echo "  Recomendado: sacá la carpeta del proyecto de ahí, por ejemplo:"
-        echo "    mv \"$PROJECT_DIR\" \"$HOME/VisualesUCLV\""
-        echo "  y volvé a correr build_app.sh desde la nueva ubicación."
+        echo "⚠ AVISO: la app se generaría dentro de una carpeta protegida de macOS"
+        echo "  ($APP_DIR). El sistema puede bloquearla en silencio."
+        echo "  Recomendado dejarla en ~/Applications (lo que hace por defecto)."
         echo ""
         read -p "¿Continuar de todas formas acá? [s/N] " resp
         if [[ ! "$resp" =~ ^[sS]$ ]]; then
@@ -40,14 +54,9 @@ case "$PROJECT_DIR" in
         ;;
 esac
 
-if [[ ! -d "$PROJECT_DIR/venv" ]]; then
-    echo "⚠ No encuentro el entorno virtual (venv) en $PROJECT_DIR."
-    echo "  Corré primero ./run.sh al menos una vez para instalar todo."
-    exit 1
-fi
-
 APP_VERSION="$(cat "$PROJECT_DIR/VERSION" 2>/dev/null || echo "0.0.0")"
 
+mkdir -p "$APP_DIR"
 echo "➜ Creando $APP_PATH (versión $APP_VERSION) …"
 rm -rf "$APP_PATH"
 mkdir -p "$APP_PATH/Contents/MacOS"
@@ -87,6 +96,7 @@ cat > "$APP_PATH/Contents/MacOS/launcher" << LAUNCHER
 #!/usr/bin/env bash
 # Generado por build_app.sh — se regenera cada vez que lo corrés de nuevo.
 PROJECT_DIR="${PROJECT_DIR}"
+PYTHON_BIN="${PYTHON_BIN}"
 LOG_FILE="/tmp/visualesuclv-launch.log"
 
 fail() {
@@ -102,13 +112,15 @@ fi
 
 cd "\$PROJECT_DIR" || fail "No se pudo entrar a la carpeta \$PROJECT_DIR"
 
-if [[ ! -f venv/bin/activate ]]; then
-    fail "No se encontró el entorno virtual (venv) en \$PROJECT_DIR. Abrí Terminal, entrá a esa carpeta, y corré ./run.sh primero."
+if [[ ! -x "\$PYTHON_BIN" ]]; then
+    fail "No se encontró el intérprete de Python en \$PYTHON_BIN. Si cambió de ruta, volvé a correr build_app.sh."
 fi
 
-source venv/bin/activate
+if ! "\$PYTHON_BIN" -c "import PySide6" >/dev/null 2>&1; then
+    fail "\$PYTHON_BIN no tiene PySide6. Instalá las dependencias con: \$PYTHON_BIN -m pip install -r requirements.txt"
+fi
 
-python3 main.py > "\$LOG_FILE" 2>&1
+"\$PYTHON_BIN" main.py > "\$LOG_FILE" 2>&1
 STATUS=\$?
 
 if [[ \$STATUS -ne 0 ]]; then
@@ -141,6 +153,6 @@ fi
 # la primera vez que se abre.
 xattr -cr "$APP_PATH" 2>/dev/null || true
 
-echo "✓ Listo: \"${APP_NAME}.app\" (v${APP_VERSION}) está en tu Escritorio."
+echo "✓ Listo: \"${APP_NAME}.app\" (v${APP_VERSION}) está en $APP_DIR."
 echo "  Doble clic para abrir. Si igual aparece una advertencia de macOS"
 echo "  la primera vez, hacé clic derecho sobre la app › Abrir."
