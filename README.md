@@ -60,22 +60,29 @@ python3 main.py
 
 ## Uso
 
-- La app abre en **🕐 Historial** ("Continuar viendo"): todo lo que
-  tenés a medio ver, con carátula y porcentaje. Clic para seguir donde
-  quedaste, clic derecho para quitarlo de la lista. Botón "🏠 Inicio"
-  para ir al catálogo completo.
+- La app abre en la **pantalla de Inicio** estilo plataforma de streaming:
+  un banner principal rotatorio y filas horizontales (Continuar viendo,
+  Películas, Series, Infantiles, Agregados recientemente, Favoritos) con
+  carátulas y ficha de TMDb.
+- El Inicio se arma con el **árbol de carpetas que el propio servidor
+  publica** en `https://visuales.uclv.cu/listado.html` (generado con
+  `tree`, ~30.000 carpetas). Un solo archivo da el esqueleto completo del
+  sitio, así que no hay que escanear carpeta por carpeta: se descarga una
+  vez y queda cacheado en
+  `~/Library/Application Support/VisualesUCLV/sitemap.json` (se refresca
+  solo cada 7 días).
 - **Búsqueda global**: el buscador de arriba filtra la carpeta actual
   mientras escribís, pero si apretás **Enter** (o el botón 🔍 al lado)
   busca por título en TODO el servidor, no solo donde estás parado.
   La primera vez indexa todo el sitio en segundo plano (puede tardar
   según el tamaño), y después queda cacheado — "🔄 Reindexar" si se
   agregó contenido nuevo y querés actualizarlo.
-- Doble clic en una carpeta → entra. Si la carpeta tiene un video +
-  `sinopsis.txt`, se abre automáticamente una **vista de detalle estilo
-  Netflix** (carátula, sinopsis, botón grande de reproducir) en vez del
-  listado plano. Podés volver al listado de archivos crudo con el botón
-  "📁 Ver todos los archivos" (útil para ver subtítulos sueltos, extras,
-  etc.). Doble clic directo en un archivo de video reproduce.
+- Doble clic en una carpeta → entra. Si la carpeta tiene un video o es una
+  carpeta "hoja" (videos sin más subcarpetas), se abre automáticamente una
+  **vista de detalle estilo Netflix** (carátula, sinopsis, botón grande de
+  reproducir) en vez del listado plano. Podés volver al listado de archivos
+  crudo con el botón "📁 Ver todos los archivos" (útil para ver subtítulos
+  sueltos, extras, etc.). Doble clic directo en un archivo de video reproduce.
 - Clic derecho sobre un archivo → reproducir, descargar, u olvidar progreso.
 - La navegación principal está en la **barra superior**: el menú
   **"Explorar ▾"** reúne Inicio, Historial y las categorías (Películas,
@@ -230,6 +237,7 @@ run.sh              → arranque con auto-instalación de todo
 main.py             → punto de entrada
 theme.py            → tokens de diseño + generación del QSS (tema oscuro)
 apache_index.py     → parser del listado "Index of /..." de Apache
+sitemap.py          → árbol de carpetas del sitio (listado.html), cacheado
 player.py           → reproductor embebido con mpv + controles
 progress.py         → guarda el punto de reproducción (resume)
 thumbnails.py        → busca/descarga carátulas/backdrops (cache en disco)
