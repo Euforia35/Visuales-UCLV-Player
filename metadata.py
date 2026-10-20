@@ -114,6 +114,63 @@ class MetadataStore:
         with self._lock:
             return folder_url in self._data
 
+    def remove(self, folder_url: str):
+        """Borra la ficha cacheada de una carpeta (ej. cuando el usuario
+        corrige el nombre y la búsqueda anterior ya no vale)."""
+        with self._lock:
+            if folder_url in self._data:
+                del self._data[folder_url]
+                self._save()
+
     def __len__(self):
         with self._lock:
             return len(self._data)
+
+
+class TitleOverrideStore:
+    """Título de búsqueda corregido A MANO por el usuario, por carpeta.
+
+    A veces la carpeta del servidor tiene el nombre mal escrito
+    ("The mandalorian X1") y TMDb no encuentra nada. El usuario puede
+    escribir el nombre correcto desde la vista de detalle; se guarda acá
+    (JSON en disco) y se usa SIEMPRE en lugar del nombre de la carpeta
+    para buscar la ficha."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._lock = threading.Lock()
+        self._data: dict[str, str] = {}
+        self._load()
+
+    def _load(self):
+        if self.path.exists():
+            try:
+                data = json.loads(self.path.read_text())
+                if isinstance(data, dict):
+                    self._data = {k: str(v) for k, v in data.items()}
+            except Exception:
+                self._data = {}
+
+    def _save(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self._data, ensure_ascii=False, indent=2))
+        except Exception:
+            pass
+
+    def get(self, folder_url: str) -> str:
+        with self._lock:
+            return self._data.get(folder_url, "")
+
+    def set(self, folder_url: str, title: str):
+        """Guarda (o borra, si `title` viene vacío) el título corregido."""
+        title = (title or "").strip()
+        with self._lock:
+            if title:
+                self._data[folder_url] = title
+            else:
+                self._data.pop(folder_url, None)
+            self._save()
+
+    def clear(self, folder_url: str):
+        self.set(folder_url, "")

@@ -37,12 +37,12 @@ from music_view import MusicAlbumView, MusicPlayerBar, LyricsDialog, ALBUM_COVER
 from audio_metadata import AudioMetadataManager
 from lyrics import fetch_lyrics
 from config_store import ConfigStore
-from online_dialogs import ApiKeyDialog, SubtitleSearchDialog
+from online_dialogs import ApiKeyDialog, SubtitleSearchDialog, SearchTitleDialog
 from local_subs_dialog import LocalSubsDialog
 import tmdb
 import theme
 from naming import clean_display_title, episode_display, parse_year
-from metadata import MetadataStore, MediaMeta, meta_from_tmdb_info
+from metadata import MetadataStore, MediaMeta, meta_from_tmdb_info, TitleOverrideStore
 from cards import CardData, POSTER_SIZE as CARD_POSTER_SIZE
 from home_view import HomeView
 from history_view import HistoryView, COVER_SIZE as HISTORY_COVER_SIZE
@@ -56,6 +56,7 @@ PROGRESS_FILE = APP_SUPPORT_DIR / "progress.json"
 CONFIG_FILE = APP_SUPPORT_DIR / "config.json"
 CATALOG_FILE = APP_SUPPORT_DIR / "catalog.json"
 METADATA_CACHE_FILE = APP_SUPPORT_DIR / "metadata_cache.json"
+TITLE_OVERRIDE_FILE = APP_SUPPORT_DIR / "title_overrides.json"
 THUMBNAILS_DIR = APP_SUPPORT_DIR / "thumbnails_v2"  # v2: caché re-validada con Pillow (ver thumbnails.py)
 DOWNLOADS_DIR = Path.home() / "Downloads" / "VisualesUCLV"
 PROGRESS_SAVE_INTERVAL_MS = 5000
@@ -206,6 +207,10 @@ class MainWindow(QMainWindow):
         self._listing_request_id = 0
         self._synopsis_request_id = 0
         self._imdb_request_id = 0
+        # True si la búsqueda de TMDb la pidió el usuario a mano (y no la
+        # búsqueda automática al abrir la carpeta): solo en ese caso le
+        # ofrecemos corregir el nombre si no se encontró nada.
+        self._imdb_manual_request = False
         self._music_cover_set = False
 
         self._listing_ready_signal.connect(self._on_listing_ready)
@@ -231,6 +236,9 @@ class MainWindow(QMainWindow):
         self._music_folder_poster_key: str | None = None
         self.config = ConfigStore(CONFIG_FILE)
         self.meta_store = MetadataStore(METADATA_CACHE_FILE)
+        # Títulos corregidos a mano por el usuario (carpetas con el
+        # nombre mal escrito) para la búsqueda en TMDb.
+        self.title_overrides = TitleOverrideStore(TITLE_OVERRIDE_FILE)
         self._home_built_at = 0.0
         self.catalog = SiteCatalog(self.client, CATALOG_FILE)
         self.catalog.progress.connect(self._on_catalog_progress)
@@ -398,6 +406,7 @@ class MainWindow(QMainWindow):
         self.detail_view.play_requested.connect(self._on_detail_play_requested)
         self.detail_view.show_files_requested.connect(self._show_raw_file_list)
         self.detail_view.imdb_requested.connect(self._on_imdb_requested)
+        self.detail_view.edit_title_requested.connect(self._on_edit_title_requested)
         self.stack.addWidget(self.detail_view)
 
         self.music_view = MusicAlbumView()
@@ -527,11 +536,34 @@ class MainWindow(QMainWindow):
 
     _SEASON_NAME_RE = re.compile(r"^(temporada|season|t\d+|s\d+)\b", re.IGNORECASE)
 
+    def _series_root_url(self, folder_url: str) -> str:
+        """Para una carpeta de temporada (Serie/Season 1/) devuelve la
+        carpeta de la serie (Serie/); para todo lo demás, la misma URL.
+        Así una corrección de nombre vale para todas las temporadas."""
+        if self._detail_media_type != "tv":
+            return folder_url
+        parts = [p for p in urlparse(folder_url).path.split("/") if p]
+        if not parts or not self._SEASON_NAME_RE.match(parts[-1].strip()):
+            return folder_url
+        parent = "/".join(parts[:-1])
+        return BASE_URL.rstrip("/") + "/" + parent + "/"
+
     def _search_title_for_detail(self, folder_url: str, displayed_title: str) -> str:
-        """Para series organizadas como Serie/Temporada 1/, el nombre de
-        la carpeta que activa la vista de detalle suele ser la
-        temporada, no el nombre de la serie — así que para buscar en
-        TMDb usamos la carpeta padre en ese caso."""
+        """Nombre con el que buscar en TMDb.
+
+        Prioridad:
+        1. El título corregido a mano por el usuario (carpetas con el
+           nombre mal escrito, ej. "The mandalorian X1"). Para carpetas
+           de temporada, vale la corrección hecha sobre la serie.
+        2. Para series organizadas como Serie/Temporada 1/, la carpeta
+           padre (el nombre de la temporada no es el de la serie).
+        3. El título mostrado."""
+        override = (
+            self.title_overrides.get(folder_url)
+            or self.title_overrides.get(self._series_root_url(folder_url))
+        )
+        if override:
+            return override
         if self._detail_media_type != "tv":
             return displayed_title
         if self._SEASON_NAME_RE.match(displayed_title.strip()):
@@ -629,6 +661,7 @@ class MainWindow(QMainWindow):
         year = match.group(1) if match else None
         clean_title = re.sub(r"\s*\(\d{4}\)\s*$", "", search_title).strip()
         self._imdb_request_id += 1
+        self._imdb_manual_request = False
         try:
             self._io_executor.submit(
                 self._fetch_imdb_bg, api_key, clean_title, year,
@@ -864,6 +897,7 @@ class MainWindow(QMainWindow):
         tipo = "serie" if self._detail_media_type == "tv" else "película"
         self.detail_view.set_synopsis(f"Buscando \"{clean_title}\" ({tipo}) en TMDb (en español)…")
         self._imdb_request_id += 1
+        self._imdb_manual_request = True
         try:
             self._io_executor.submit(
                 self._fetch_imdb_bg, api_key, clean_title, year,
@@ -871,6 +905,46 @@ class MainWindow(QMainWindow):
             )
         except RuntimeError:
             pass
+
+    def _on_edit_title_requested(self):
+        """El usuario corrige a mano el nombre con el que se busca la ficha:
+        útil cuando la carpeta del servidor tiene el título mal escrito y
+        TMDb no encuentra nada ("The mandalorian X1")."""
+        folder_url = self._detail_folder_url or ""
+        if not folder_url:
+            return
+
+        # Guardamos la corrección sobre la RAÍZ de la serie (si es una
+        # carpeta de temporada), así vale para todas las temporadas.
+        key = self._series_root_url(folder_url)
+        # Pre-cargamos con lo que ya había: el override guardado, o el
+        # nombre que se usaría igual (título mostrado / carpeta padre).
+        current = (
+            self.title_overrides.get(key)
+            or self._search_title_for_detail(
+                folder_url, self.detail_view.title_label.text()
+            )
+        )
+        is_series = self._detail_media_type == "tv"
+        dlg = SearchTitleDialog(current, is_series, self)
+        if dlg.exec() != SearchTitleDialog.Accepted or not dlg.title:
+            return
+
+        self.title_overrides.set(key, dlg.title)
+        # La ficha cacheada (si la había) es de la búsqueda vieja y ya no
+        # vale: la borramos para que no pise el resultado nuevo. Como el
+        # caché es un JSON en disco, lo reescribimos sin esa clave.
+        self.meta_store.remove(folder_url)
+        if key != folder_url:
+            self.meta_store.remove(key)
+
+        # Refrescamos el título visible con lo que escribió el usuario
+        # (sin el año entre paréntesis, que solo sirve para la búsqueda).
+        shown = re.sub(r"\s*\(\d{4}\)\s*$", "", dlg.title).strip() or dlg.title
+        self.detail_view.set_title(shown)
+
+        # Y disparamos la búsqueda ya, sin obligar a tocar otro botón.
+        self._on_imdb_requested()
 
     def _fetch_imdb_bg(self, api_key: str, title: str, year: str | None,
                        media_type: str, request_id: int, folder_url: str):
@@ -883,11 +957,38 @@ class MainWindow(QMainWindow):
         if error:
             if self.stack.currentWidget() is self.detail_view and folder_url == self._detail_folder_url:
                 self.detail_view.set_synopsis(f"TMDb: {error}")
+                # Si el usuario buscó a mano y no apareció nada, lo más
+                # probable es que el nombre de la carpeta esté mal
+                # escrito: le ofrecemos corregirlo en el momento.
+                if self._imdb_manual_request and self._is_not_found_error(error):
+                    self._offer_title_correction(folder_url, error)
             return
         if info:
             # _on_meta_ready guarda en caché, actualiza el home y aplica
             # a la vista de detalle si sigue abierta esta carpeta
             self._meta_ready_signal.emit(folder_url, meta_from_tmdb_info(info))
+
+    @staticmethod
+    def _is_not_found_error(error: str) -> bool:
+        return "no se encontró" in (error or "").lower()
+
+    def _offer_title_correction(self, folder_url: str, error: str):
+        """Pregunta si quiere corregir el nombre y, si acepta, abre el
+        diálogo de corrección (mismo camino que el botón «Corregir nombre»)."""
+        box = QMessageBox(self)
+        box.setWindowTitle("No se encontró en TMDb")
+        box.setIcon(QMessageBox.Question)
+        box.setText(
+            "TMDb no encontró esta ficha.\n\n"
+            "Puede que el nombre de la carpeta esté mal escrito. "
+            "¿Querés corregirlo y volver a buscar?"
+        )
+        box.setInformativeText(error)
+        yes = box.addButton("✏  Corregir nombre", QMessageBox.AcceptRole)
+        box.addButton("Cancelar", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is yes:
+            self._on_edit_title_requested()
 
     def _on_online_subtitles_requested(self):
         api_key = self._ensure_api_key(
@@ -1355,6 +1456,11 @@ class MainWindow(QMainWindow):
             self._apply_meta_to_detail(meta)
 
     def _apply_meta_to_detail(self, meta: MediaMeta):
+        # Si TMDb devolvió un título, mostramos ESE (bien escrito) en vez
+        # del nombre crudo de la carpeta — es justo lo que se busca al
+        # corregir un nombre mal escrito.
+        if meta.title:
+            self.detail_view.set_title(meta.title)
         self.detail_view.set_chips(meta.chips())
         if meta.overview:
             self.detail_view.set_synopsis(meta.overview)
