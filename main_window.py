@@ -14,7 +14,7 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote
 
 from PySide6.QtCore import Qt, Signal, QObject, QTimer, QSize, QEvent
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont
@@ -109,6 +109,18 @@ def _clean_title(name: str) -> str:
     name = unquote(name)
     name = name.replace(".", " ").replace("_", " ").strip()
     return " ".join(name.split())
+
+
+def _sitemap_url(path: str) -> str:
+    """Ruta del sitemap ("/Series/...") -> URL completa con barra final.
+
+    `listado.html` guarda solo rutas relativas: usarlas tal cual como
+    URL de navegación hace que requests falle con
+    "Invalid URL '/...': No scheme supplied".
+    """
+    if path.startswith(("http://", "https://")):
+        return path
+    return BASE_URL + quote(path.lstrip("/"), safe="/").rstrip("/") + "/"
 
 
 def _parse_size_to_bytes(size_str: str) -> float:
@@ -1401,7 +1413,7 @@ class MainWindow(QMainWindow):
             for year_dir, quota in zip(year_dirs[:4], (8, 6, 4, 2)):
                 leaves = sitemap.leaf_children(year_dir)
                 random.shuffle(leaves)
-                movie_pool.extend(leaves[:quota])
+                movie_pool.extend(_sitemap_url(p) for p in leaves[:quota])
 
             # Cubanas recientes (el nombre suele empezar con el año).
             cubanas = [
@@ -1413,7 +1425,7 @@ class MainWindow(QMainWindow):
                 if int(parse_year(c.rsplit("/", 1)[-1]) or 0) >= current_year - 10
             ]
             random.shuffle(recent_cubanas)
-            movie_pool.extend(recent_cubanas[:2])
+            movie_pool.extend(_sitemap_url(p) for p in recent_cubanas[:2])
 
             # Series: carpetas de primer nivel con año reciente en el nombre.
             for root in ("/Series/Espanol", "/Series/Ingles",
@@ -1424,15 +1436,16 @@ class MainWindow(QMainWindow):
                     if int(parse_year(c.rsplit("/", 1)[-1]) or 0) >= current_year - 3
                 ]
                 random.shuffle(dated)
-                series_pool.extend(dated[:4])
+                series_pool.extend(_sitemap_url(p) for p in dated[:4])
 
             # Lo que el servidor marcó como reciente (Recientes/).
             for path in sitemap.leaf_children("/Recientes"):
                 name = path.rsplit("/", 1)[-1]
+                url = _sitemap_url(path)
                 if re.search(r"(?i)(?:^|[.\s_-])s\d{1,2}(?:[.\s_-]|$)|season|temporada|cap[ií]tulo", name):
-                    series_pool.append(path)
+                    series_pool.append(url)
                 else:
-                    movie_pool.append(path)
+                    movie_pool.append(url)
 
         # Respaldo: si el árbol no trajo nada, usar las tarjetas de fila.
         if not movie_pool:

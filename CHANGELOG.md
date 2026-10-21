@@ -24,6 +24,9 @@
   año (películas de `Extranjeras/2026`, `2025`, `2024`, `2023`, series
   con año reciente y lo publicado en `Recientes/`), se mezclan
   películas y series, y se elige al azar en cada carga del Inicio.
+  Las tarjetas del banner llevan la URL completa: antes usaban la ruta
+  interna del sitemap (`/Series/…`) y al hacer clic fallaban con
+  «Invalid URL … No scheme supplied».
 - **Búsqueda global desde `listado.html`**: la búsqueda por título usa
   el árbol de carpetas que publica el servidor, así que es instantánea
   — ya no indexa recursivamente todo el sitio ni mantiene un índice
