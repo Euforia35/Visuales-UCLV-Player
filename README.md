@@ -196,7 +196,7 @@ para ver qué cambió). Después de probarla, regenerá el `.app` liviano
 (en `~/Applications`):
 
 ```bash
-./build_app.sh
+./instalar_app.sh
 ```
 
 ## Generar una app de doble clic (sin volver a tocar la Terminal)
@@ -227,6 +227,30 @@ doble clic para abrir — no hace falta Terminal ni Python a la vista.
 > Si más adelante movés o renombrás la carpeta del proyecto
 > (`VisualesUCLV`), la app deja de encontrarla — volvé a correr
 > `./build_app.sh` para regenerarla apuntando a la nueva ubicación.
+
+### Reinstalar tras cada cambio (acceso en el Escritorio)
+
+La app instalada no se actualiza sola: cuando modifiques el proyecto hay
+que regenerarla. Para no escribir comandos cada vez, creá **una sola
+vez** un acceso de doble clic en el Escritorio:
+
+```bash
+./instalar_app.sh --acceso
+```
+
+Esto reconstruye la app en `~/Applications` **y** deja
+`~/Desktop/Instalar Visuales UCLV.command`. De ahí en adelante, cada vez
+que cambies el código: doble clic en ese archivo y listo — si la app
+estaba abierta la cierra, la regenera y te muestra el resultado. Desde
+la Terminal es lo mismo que:
+
+```bash
+./instalar_app.sh            # --abrir para abrirla al terminar
+```
+
+> El acceso del Escritorio guarda la ruta actual del proyecto. Si movés
+> o renombrás la carpeta, corré `./instalar_app.sh --acceso` desde la
+> ubicación nueva para que vuelva a apuntar bien.
 
 **Importante:** esta app de doble clic sigue dependiendo de la carpeta
 del proyecto y del Python que tiene las dependencias (solo te ahorra la

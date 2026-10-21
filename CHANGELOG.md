@@ -31,6 +31,11 @@
   libmpv puede hacer SIGSEGV en macOS) y la app sale con `os._exit` al
   cerrar, para no quedarse colgada esperando descargas de portadas en
   segundo plano.
+- **Reinstalar sin comandos**: nuevo `instalar_app.sh`, que reconstruye
+  la app en `~/Applications` cerrando antes la instancia abierta (sin
+  diálogos de error ni procesos huérfanos). Con `--acceso` crea, una
+  sola vez, `~/Desktop/Instalar Visuales UCLV.command`: doble clic para
+  reinstalar después de cada cambio, sin abrir la Terminal.
 
 ## 1.7.0
 - **Elegir subtítulos de la carpeta (pop-up)**: al abrir un video,
