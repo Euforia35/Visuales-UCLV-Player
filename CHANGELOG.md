@@ -12,6 +12,13 @@
   mpv externo por IPC (o se fuerza con `VISUALES_PLAYER=external`).
   Nuevos atajos: Espacio (play/pausa), ←/→ (±10s), F (pantalla
   completa de la app), Esc (salir).
+- **Modo cine en pantalla completa**: al entrar a pantalla completa con
+  el reproductor embebido se oculta **toda** la interfaz (barra
+  superior, fila de navegación, estado, botón "volver", barra de música
+  y los propios controles) y queda solo el video. Los controles
+  reaparecen al mover el mouse y se vuelven a esconder solos a los 3 s
+  (estilo mpv); al salir de pantalla completa se restaura todo tal como
+  estaba.
 - **Hero del Inicio aleatorio y reciente**: el banner ya no sale casi
   siempre de `Peliculas/Cubanas`. Ahora se arma un pool ponderado por
   año (películas de `Extranjeras/2026`, `2025`, `2024`, `2023`, series

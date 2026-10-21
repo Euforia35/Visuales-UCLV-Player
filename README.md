@@ -40,7 +40,9 @@ propia ventana y no hay dos colas de eventos de Cocoa compitiendo.
 
 - Atajos en el reproductor: **Espacio** play/pausa, **←/→** ±10s,
   **F** pantalla completa (de la app), **Esc** salir de pantalla
-  completa.
+  completa. Al entrar a pantalla completa se oculta **toda** la
+  interfaz (modo cine): los controles vuelven al mover el mouse y se
+  esconden solos a los 3 s.
 
 ## Forma más fácil de correrla: `run.sh`
 

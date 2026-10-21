@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 
-from PySide6.QtCore import Qt, Signal, QObject, QTimer, QSize
+from PySide6.QtCore import Qt, Signal, QObject, QTimer, QSize, QEvent
 from PySide6.QtGui import QIcon, QPixmap, QPainter, QColor, QFont
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
@@ -223,6 +223,11 @@ class MainWindow(QMainWindow):
         # ofrecemos corregir el nombre si no se encontró nada.
         self._imdb_manual_request = False
         self._music_cover_set = False
+        # Modo cine: con la ventana en pantalla completa y el reproductor
+        # a la vista se oculta toda la interfaz (barra superior, fila de
+        # navegación, márgenes, controles…). Ver _set_cinema_mode.
+        self._cinema = False
+        self._cinema_visibility = {}
 
         self._listing_ready_signal.connect(self._on_listing_ready)
         self._synopsis_ready_signal.connect(self._on_synopsis_ready)
@@ -282,6 +287,7 @@ class MainWindow(QMainWindow):
         # buscador e íconos), así las filas de tarjetas ganan todo el ancho.
         topbar = QWidget()
         topbar.setObjectName("topbar")
+        self.topbar = topbar
         topbar_layout = QHBoxLayout(topbar)
         topbar_layout.setContentsMargins(22, 12, 22, 12)
         topbar_layout.setSpacing(12)
@@ -366,10 +372,16 @@ class MainWindow(QMainWindow):
         main_layout = QVBoxLayout(main_panel)
         main_layout.setContentsMargins(20, 12, 20, 16)
         main_layout.setSpacing(10)
+        self.main_layout = main_layout
+        self._normal_margins = main_layout.contentsMargins()
 
         # Fila de navegación (atrás/adelante/refrescar + breadcrumb),
-        # visible sobre todo cuando estás explorando carpetas.
-        nav_row = QHBoxLayout()
+        # visible sobre todo cuando estás explorando carpetas. Va dentro
+        # de un widget propio para poder ocultarla entera en pantalla
+        # completa (modo cine).
+        self.nav_bar = QWidget()
+        nav_row = QHBoxLayout(self.nav_bar)
+        nav_row.setContentsMargins(0, 0, 0, 0)
         self.back_btn = QToolButton()
         self.back_btn.setText("◀")
         self.back_btn.setToolTip("Atrás")
@@ -392,7 +404,7 @@ class MainWindow(QMainWindow):
         nav_row.addWidget(self.refresh_btn)
         nav_row.addSpacing(10)
         nav_row.addWidget(self.breadcrumb, stretch=1)
-        main_layout.addLayout(nav_row)
+        main_layout.addWidget(self.nav_bar)
 
         self.status_label = QLabel("")
         self.status_label.setObjectName("statusLabel")
@@ -455,6 +467,11 @@ class MainWindow(QMainWindow):
 
         root_layout.addWidget(main_panel, stretch=1)
         self.setCentralWidget(root)
+
+        # Si cambia la página (abrir/cerrar el reproductor) mientras la
+        # ventana ya está en pantalla completa, reevaluar el modo cine:
+        # la interfaz se oculta solo con el reproductor a la vista.
+        self.stack.currentChanged.connect(self._update_cinema)
 
     # ------------------------------------------------------------------
     # Navegación
@@ -1863,7 +1880,7 @@ class MainWindow(QMainWindow):
 
     def _open_player(self, url: str, title: str, start_at: float = 0.0, subtitle_urls: list | None = None):
         self.stack.setCurrentWidget(self.player)
-        self.close_player_btn.show()
+        self.close_player_btn.setVisible(not self._cinema)
         self.player.play(url, title=title, start_at=start_at, subtitle_urls=subtitle_urls)
 
     def _on_video_finished(self):
@@ -1897,6 +1914,48 @@ class MainWindow(QMainWindow):
         self.close_player_btn.hide()
         # refresca los porcentajes en la lista al volver
         self._populate_list(self.current_entries)
+
+    # ------------------------------------------------------------------
+    # Pantalla completa (modo cine): ocultar toda la interfaz
+    # ------------------------------------------------------------------
+    def changeEvent(self, event):
+        if event.type() == QEvent.WindowStateChange:
+            self._update_cinema()
+            # Reevaluar también un tick después: en macOS la transición
+            # a pantalla completa es animada y el estado puede asentarse
+            # un instante más tarde.
+            QTimer.singleShot(0, self._update_cinema)
+        super().changeEvent(event)
+
+    def _update_cinema(self, *_args):
+        if not hasattr(self, "stack"):
+            return  # la interfaz todavía no está armada
+        self._set_cinema_mode(
+            self.isFullScreen()
+            and self.stack.currentWidget() is self.player
+            and self.player.embedded
+        )
+
+    def _set_cinema_mode(self, on: bool):
+        if on == self._cinema:
+            return
+        self._cinema = on
+        piezas = (
+            self.topbar, self.nav_bar, self.status_label,
+            self.close_player_btn, self.music_bar,
+        )
+        if on:
+            # Recordar qué se veía, para restaurarlo tal cual al salir.
+            self._cinema_visibility = {w: w.isVisible() for w in piezas}
+            for w in piezas:
+                w.hide()
+            self.main_layout.setContentsMargins(0, 0, 0, 0)
+        else:
+            for w, visible in self._cinema_visibility.items():
+                w.setVisible(visible)
+            self._cinema_visibility = {}
+            self.main_layout.setContentsMargins(self._normal_margins)
+        self.player.set_cinema_mode(on)
 
     def _save_current_progress(self):
         url = getattr(self.player, "current_url", None)

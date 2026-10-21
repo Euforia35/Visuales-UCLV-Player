@@ -12,11 +12,11 @@ y abre su propia ventana; este widget solo manda comandos por IPC.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, QEvent
 from PySide6.QtGui import QShortcut, QKeySequence
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSlider, QLabel, QPushButton,
-    QStackedWidget,
+    QStackedWidget, QApplication,
 )
 
 from mpv_ipc import MpvIPCPlayer, find_mpv_binary
@@ -67,6 +67,7 @@ class PlayerWidget(QWidget):
         self._paused = False
         self._eof_callback_registered = False
         self._seek_callback_registered = False
+        self._cinema = False
 
         # Backend embebido por defecto; si algo falla, se usa el externo.
         self._embedded = EMBEDDED_AVAILABLE
@@ -131,6 +132,7 @@ class PlayerWidget(QWidget):
         # --- Controles -------------------------------------------------
         controls = QWidget(self)
         controls.setObjectName("playerControls")
+        self.controls = controls
         c_layout = QVBoxLayout(controls)
         c_layout.setContentsMargins(14, 10, 14, 10)
         c_layout.setSpacing(4)
@@ -204,6 +206,21 @@ class PlayerWidget(QWidget):
         self._ui_timer.timeout.connect(self._refresh_ui)
         self._ui_timer.start()
 
+        # Modo cine (pantalla completa): si pasan unos segundos sin que
+        # se mueva el mouse, los controles se esconden solos; cualquier
+        # movimiento por la app los trae de vuelta (ver set_cinema_mode).
+        self._cinema_hide_timer = QTimer(self)
+        self._cinema_hide_timer.setSingleShot(True)
+        self._cinema_hide_timer.setInterval(3000)
+        self._cinema_hide_timer.timeout.connect(self._hide_controls_cinema)
+        # Con el mouse tracking activado en todo el reproductor, los
+        # movimientos que no caen sobre el propio PlayerWidget (el video,
+        # los botones…) igual llegan y cuentan para no esconder los
+        # controles mientras se los está usando.
+        self.setMouseTracking(True)
+        for hijo in self.findChildren(QWidget):
+            hijo.setMouseTracking(True)
+
     def _install_shortcuts(self):
         def shortcut(key, handler):
             sc = QShortcut(QKeySequence(key), self)
@@ -216,6 +233,63 @@ class PlayerWidget(QWidget):
         self._sc_right = shortcut(Qt.Key_Right, lambda: self.seek_relative(10))
         self._sc_full = shortcut(Qt.Key_F, self._toggle_fullscreen)
         self._sc_esc = shortcut(Qt.Key_Escape, self._exit_fullscreen)
+
+    # ------------------------------------------------------------------
+    # Modo cine (pantalla completa)
+    # ------------------------------------------------------------------
+    @property
+    def embedded(self) -> bool:
+        return self._embedded
+
+    def set_cinema_mode(self, on: bool):
+        """La ventana principal avisa al entrar/salir de pantalla completa.
+        En modo cine no se ve nada más que el video: los controles vuelven
+        al mover el mouse y se esconden solos a los 3 s."""
+        self._cinema = on
+        app = QApplication.instance()
+        if on:
+            if app is not None:
+                app.installEventFilter(self)
+            self.controls.hide()
+            self.setCursor(Qt.BlankCursor)
+            self.setFocusPolicy(Qt.StrongFocus)
+            self.setFocus(Qt.OtherFocusReason)
+            self._cinema_hide_timer.stop()
+        else:
+            if app is not None:
+                app.removeEventFilter(self)
+            self._cinema_hide_timer.stop()
+            self.controls.show()
+            self.unsetCursor()
+
+    def eventFilter(self, obj, event):
+        # Cualquier movimiento del mouse durante el modo cine devuelve
+        # los controles (y reinicia el contador para esconderlos).
+        if self._cinema and event.type() == QEvent.MouseMove:
+            self._show_controls_temporarily()
+        return super().eventFilter(obj, event)
+
+    def _show_controls_temporarily(self):
+        if not self._cinema:
+            return
+        if not self.controls.isVisible():
+            self.controls.show()
+            self.unsetCursor()
+        self._cinema_hide_timer.start()
+
+    def _hide_controls_cinema(self):
+        if not self._cinema:
+            return
+        self.controls.hide()
+        self.setCursor(Qt.BlankCursor)
+        # Si el foco quedó en un botón de los controles, devolverlo al
+        # reproductor para que sigan andando los atajos (Espacio, F, Esc).
+        self.setFocus(Qt.OtherFocusReason)
+
+    def mouseMoveEvent(self, event):
+        if self._cinema:
+            self._show_controls_temporarily()
+        super().mouseMoveEvent(event)
 
     def _set_controls_enabled(self, enabled: bool):
         for w in (
@@ -507,6 +581,9 @@ class PlayerWidget(QWidget):
 
     def shutdown(self):
         self._ui_timer.stop()
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
         if self._embedded and self.video is not None:
             self.video.shutdown()
             self._mpv = None
