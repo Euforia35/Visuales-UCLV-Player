@@ -9,6 +9,7 @@ descargas y panel de reproducción.
 from __future__ import annotations
 
 import json
+import random
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -46,7 +47,6 @@ from metadata import MetadataStore, MediaMeta, meta_from_tmdb_info, TitleOverrid
 from cards import CardData, POSTER_SIZE as CARD_POSTER_SIZE
 from home_view import HomeView
 from history_view import HistoryView, COVER_SIZE as HISTORY_COVER_SIZE
-from catalog import SiteCatalog
 from sitemap import SiteMap
 from search_dialog import GlobalSearchDialog
 
@@ -54,7 +54,6 @@ APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "VisualesUCL
 FAVORITES_FILE = APP_SUPPORT_DIR / "favorites.json"
 PROGRESS_FILE = APP_SUPPORT_DIR / "progress.json"
 CONFIG_FILE = APP_SUPPORT_DIR / "config.json"
-CATALOG_FILE = APP_SUPPORT_DIR / "catalog.json"
 METADATA_CACHE_FILE = APP_SUPPORT_DIR / "metadata_cache.json"
 TITLE_OVERRIDE_FILE = APP_SUPPORT_DIR / "title_overrides.json"
 THUMBNAILS_DIR = APP_SUPPORT_DIR / "thumbnails_v2"  # v2: caché re-validada con Pillow (ver thumbnails.py)
@@ -166,6 +165,17 @@ def _make_placeholder(entry: Entry) -> QPixmap:
     return pix
 
 
+class _ClickableLabel(QLabel):
+    """QLabel que emite clicked() al soltar el botón izquierdo."""
+
+    clicked = Signal()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+
 class MainWindow(QMainWindow):
     # Señales propias para recibir resultados de trabajo en segundo plano
     # (ver la nota más arriba sobre por qué no se usa QThread para esto).
@@ -178,6 +188,7 @@ class MainWindow(QMainWindow):
     _folder_subs_ready_signal = Signal(str, list, str)  # (url_video, entradas_subs, error)
     _home_ready_signal = Signal(object)           # (estructura de filas/hero del home)
     _meta_ready_signal = Signal(str, object)      # (folder_url, MediaMeta enriquecido)
+    _sitemap_ready_signal = Signal()              # árbol listo para buscar
 
     def __init__(self):
         super().__init__()
@@ -240,14 +251,13 @@ class MainWindow(QMainWindow):
         # nombre mal escrito) para la búsqueda en TMDb.
         self.title_overrides = TitleOverrideStore(TITLE_OVERRIDE_FILE)
         self._home_built_at = 0.0
-        self.catalog = SiteCatalog(self.client, CATALOG_FILE)
-        self.catalog.progress.connect(self._on_catalog_progress)
-        self.catalog.finished.connect(self._on_catalog_finished)
         self._active_search_dialog: GlobalSearchDialog | None = None
-        self._indexing_in_progress = False
+        self._sitemap_loading = False
+        self._pending_fav_scroll = False
 
         self._home_ready_signal.connect(self._on_home_ready)
         self._meta_ready_signal.connect(self._on_meta_ready)
+        self._sitemap_ready_signal.connect(self._on_sitemap_ready)
 
         self._build_ui()
 
@@ -276,19 +286,23 @@ class MainWindow(QMainWindow):
         topbar_layout.setContentsMargins(22, 12, 22, 12)
         topbar_layout.setSpacing(12)
 
-        logo = QLabel("VISUALES UCLV")
+        logo = _ClickableLabel("VISUALES UCLV")
         logo.setObjectName("logo")
+        logo.setCursor(Qt.PointingHandCursor)
+        logo.setToolTip("Ir a Inicio")
+        logo.clicked.connect(self._show_home)
         topbar_layout.addWidget(logo)
         topbar_layout.addSpacing(8)
 
-        # Menú desplegable "Explorar ▾" (Inicio + categorías + historial)
+        # Menú desplegable "Explorar ▾" (Favoritos + categorías + historial).
+        # Inicio ya no está acá: se llega haciendo clic en el logo.
         self.explore_btn = QToolButton()
         self.explore_btn.setObjectName("exploreBtn")
         self.explore_btn.setText("Explorar ▾")
         self.explore_btn.setPopupMode(QToolButton.InstantPopup)
         self.explore_btn.setToolTip("Navegar por el catálogo")
         explore_menu = QMenu(self.explore_btn)
-        explore_menu.addAction("🏠  Inicio", self._show_home)
+        explore_menu.addAction("⭐  Favoritos", self._show_favorites)
         explore_menu.addAction("🕐  Historial", self._show_history)
         explore_menu.addSeparator()
         for label, folder in CATEGORY_SHORTCUTS:
@@ -532,7 +546,13 @@ class MainWindow(QMainWindow):
     def _media_type_for_folder(self, folder_url: str) -> str:
         """"movie" o "tv" — decide qué endpoint de TMDb usar."""
         path_lower = urlparse(folder_url).path.lower()
-        return "tv" if "/series" in path_lower else "movie"
+        if "/series" in path_lower:
+            return "tv"
+        # Carpetas de series fuera de /Series (p. ej. Recientes/CIA.S02)
+        name = unquote(path_lower).rstrip("/").rsplit("/", 1)[-1]
+        if re.search(r"(?:^|[.\s_-])s\d{1,2}(?:$|[.\s_-])|season|temporada", name):
+            return "tv"
+        return "movie"
 
     _SEASON_NAME_RE = re.compile(r"^(temporada|season|t\d+|s\d+)\b", re.IGNORECASE)
 
@@ -1026,50 +1046,60 @@ class MainWindow(QMainWindow):
         dlg = GlobalSearchDialog(initial_query=query, parent=self)
         dlg.item_chosen.connect(self._on_search_result_chosen)
         dlg.search_requested.connect(self._on_search_query)
-        dlg.reindex_requested.connect(lambda: self._start_indexing(force=True))
+        dlg.reindex_requested.connect(self._refresh_sitemap_for_search)
         self._active_search_dialog = dlg
 
-        if self.catalog.entries:
-            dlg.set_index_ready(len(self.catalog.entries))
-        elif self.catalog.load_from_disk():
-            note = " (viejo, puede faltar contenido nuevo — reindexá si querés)" if self.catalog.is_stale() else ""
-            dlg.set_index_ready(len(self.catalog.entries))
-            dlg.status_label.setText(dlg.status_label.text() + note)
+        if self.sitemap.paths:
+            dlg.set_index_ready(len(self.sitemap.paths))
         else:
-            self._start_indexing(force=False)
+            dlg.set_status("⏳ Preparando el índice desde listado.html…")
+            self._load_sitemap_for_search()
 
         dlg.exec()
         self._active_search_dialog = None
 
-    def _start_indexing(self, force: bool):
-        if self._indexing_in_progress:
+    def _load_sitemap_for_search(self):
+        if self._sitemap_loading:
             return
-        self._indexing_in_progress = True
+        self._sitemap_loading = True
         try:
-            self._io_executor.submit(self._build_catalog_bg, force)
+            self._io_executor.submit(self._load_sitemap_bg)
         except RuntimeError:
-            self._indexing_in_progress = False
+            self._sitemap_loading = False
 
-    def _build_catalog_bg(self, force: bool):
-        self.catalog.build(BASE_URL, root_label="Inicio", force=force)
+    def _load_sitemap_bg(self):
+        try:
+            self.sitemap.ensure_loaded()
+        finally:
+            self._sitemap_ready_signal.emit()
 
-    def _on_catalog_progress(self, count: int, path: str):
-        self._indexing_in_progress = True
+    def _refresh_sitemap_for_search(self):
+        if self._sitemap_loading:
+            return
+        self._sitemap_loading = True
+        dlg = self._active_search_dialog
+        if dlg is not None:
+            dlg.set_status("⏳ Actualizando el árbol de carpetas…")
+        try:
+            self._io_executor.submit(self._refresh_sitemap_bg)
+        except RuntimeError:
+            self._sitemap_loading = False
+
+    def _refresh_sitemap_bg(self):
+        try:
+            self.sitemap.fetch()
+        finally:
+            self._sitemap_ready_signal.emit()
+
+    def _on_sitemap_ready(self):
+        self._sitemap_loading = False
         dlg = self._active_search_dialog
         if dlg is None:
             return
         try:
-            dlg.set_indexing_status(count, path)
-        except RuntimeError:
-            pass
-
-    def _on_catalog_finished(self, count: int):
-        self._indexing_in_progress = False
-        dlg = self._active_search_dialog
-        if dlg is None:
-            return
-        try:
-            dlg.set_index_ready(count)
+            dlg.set_index_ready(len(self.sitemap.paths))
+            if dlg.query_input.text().strip():
+                self._on_search_query(dlg.query_input.text())
         except RuntimeError:
             pass
 
@@ -1077,8 +1107,15 @@ class MainWindow(QMainWindow):
         dlg = self._active_search_dialog
         if dlg is None:
             return
-        results = self.catalog.search(query)
-        label = f"{len(results)} resultado(s)" if query else ""
+        if not query.strip():
+            dlg.show_results([], "")
+            return
+        if not self.sitemap.paths:
+            dlg.set_status("⏳ Preparando el índice desde listado.html…")
+            self._load_sitemap_for_search()
+            return
+        results = self.sitemap.search(query)
+        label = f"{len(results)} resultado(s) en el árbol del servidor"
         try:
             dlg.show_results(results, label)
         except RuntimeError:
@@ -1156,6 +1193,25 @@ class MainWindow(QMainWindow):
         # contenido del servidor puede haber cambiado).
         if not self._home_built_at or (time.time() - self._home_built_at) > HOME_STALE_SECONDS:
             self._refresh_home()
+
+    def _show_favorites(self):
+        """Ir a Inicio y bajar hasta la fila de Favoritos."""
+        if not self.favorites:
+            self._show_home()
+            self.status_label.setText(
+                "Todavía no marcaste favoritos: usá la ☆ de arriba a la derecha."
+            )
+            QTimer.singleShot(5000, lambda: self.status_label.setText(""))
+            return
+        self._pending_fav_scroll = True
+        self._show_home()
+        QTimer.singleShot(0, self._scroll_to_favorites)
+
+    def _scroll_to_favorites(self):
+        if not self._pending_fav_scroll:
+            return
+        self.home_view.scroll_to_row("favorites")
+        self._pending_fav_scroll = False
 
     def _refresh_home(self):
         self.home_view.show_loading("Cargando catálogo…")
@@ -1251,6 +1307,15 @@ class MainWindow(QMainWindow):
             elif key == "movies":
                 movie_cards = cards
 
+        # --- Favoritos: primera fila del home ---
+        fav_cards = []
+        for fav in self.favorites[:16]:
+            fav_cards.append(CardData(
+                key=fav["url"], title=_clean_title(fav["name"]), url=fav["url"],
+            ))
+        if fav_cards:
+            rows.insert(0, ("favorites", "Favoritos", fav_cards))
+
         # --- Continuar viendo (desde el progreso local) ---
         continue_cards = []
         for item in self.progress.list_in_progress():
@@ -1262,7 +1327,7 @@ class MainWindow(QMainWindow):
                 payload={"position": item["position"]},
             ))
         if continue_cards:
-            rows.insert(0, ("continue", "Continuar viendo", continue_cards))
+            rows.insert(1 if fav_cards else 0, ("continue", "Continuar viendo", continue_cards))
 
         # --- Agregados recientemente: el sitio expone una carpeta
         # "Recientes" en la raíz, así que la usamos directamente en vez
@@ -1278,23 +1343,13 @@ class MainWindow(QMainWindow):
         if recent_cards:
             rows.append(("recent", "Agregados recientemente", recent_cards))
 
-        # --- Favoritos ---
-        fav_cards = []
-        for fav in self.favorites[:16]:
-            fav_cards.append(CardData(
-                key=fav["url"], title=_clean_title(fav["name"]), url=fav["url"],
-            ))
-        if fav_cards:
-            rows.append(("favorites", "Tus favoritos", fav_cards))
-
-        # --- Hero: preferimos títulos con backdrop panorámico conocido ---
-        hero_pool = movie_cards + series_cards
-        with_backdrop = [c for c in hero_pool
-                         if (self.meta_store.get(c.url) or MediaMeta()).backdrop_url]
-        with_urls = {c.url for c in with_backdrop}
-        without_backdrop = [c for c in hero_pool if c.url not in with_urls]
-        hero = []
-        for card in (with_backdrop + without_backdrop)[:6]:
+        # --- Hero: mezcla aleatoria de películas y series recientes.
+        # Antes salía casi siempre de Peliculas/Cubanas porque se usaban
+        # las mismas tarjetas de las filas (y esas filas se llenaban con
+        # la primera subcarpeta grande). Ahora se arma un pool aparte,
+        # ponderado por año, y se eligen títulos al azar en cada carga. ---
+        hero = self._hero_cards(movie_cards, series_cards, limit=6)
+        for card in hero:
             stored = self.meta_store.get(card.url)
             meta_bits = []
             if stored:
@@ -1305,9 +1360,85 @@ class MainWindow(QMainWindow):
                 meta_bits = [card.meta]
             card.meta = "  ·  ".join(meta_bits)
             card.payload = {"synopsis": (stored.overview[:180] + "…") if stored and stored.overview else ""}
-            hero.append(card)
 
         self._home_ready_signal.emit({"rows": rows, "hero": hero})
+
+    def _hero_cards(self, movie_cards: list[CardData], series_cards: list[CardData],
+                    limit: int = 6) -> list[CardData]:
+        """Elige títulos para el banner: mezcla películas y series,
+        priorizando los años más recientes y variando en cada carga."""
+        current_year = time.localtime().tm_year
+        movie_pool: list[str] = []
+        series_pool: list[str] = []
+        sitemap = self.sitemap
+
+        if sitemap.paths:
+            # Películas extranjeras: carpetas por año (2026, 2025, 2024…).
+            ext_root = "/Peliculas/Extranjeras"
+            year_dirs = [
+                c for c in sitemap.children(ext_root)
+                if re.fullmatch(r"(19|20)\d{2}", c.rsplit("/", 1)[-1])
+            ]
+            year_dirs.sort(key=lambda p: int(p.rsplit("/", 1)[-1]), reverse=True)
+            # Más cupo para los años más nuevos: 2026 pesa más que 2023.
+            for year_dir, quota in zip(year_dirs[:4], (8, 6, 4, 2)):
+                leaves = sitemap.leaf_children(year_dir)
+                random.shuffle(leaves)
+                movie_pool.extend(leaves[:quota])
+
+            # Cubanas recientes (el nombre suele empezar con el año).
+            cubanas = [
+                c for c in sitemap.children("/Peliculas/Cubanas")
+                if not sitemap.children(c)
+            ]
+            recent_cubanas = [
+                c for c in cubanas
+                if int(parse_year(c.rsplit("/", 1)[-1]) or 0) >= current_year - 10
+            ]
+            random.shuffle(recent_cubanas)
+            movie_pool.extend(recent_cubanas[:2])
+
+            # Series: carpetas de primer nivel con año reciente en el nombre.
+            for root in ("/Series/Espanol", "/Series/Ingles",
+                         "/Series/NETFLIX", "/Series/Cubanos"):
+                series_folders = sitemap.children(root)
+                dated = [
+                    c for c in series_folders
+                    if int(parse_year(c.rsplit("/", 1)[-1]) or 0) >= current_year - 3
+                ]
+                random.shuffle(dated)
+                series_pool.extend(dated[:4])
+
+            # Lo que el servidor marcó como reciente (Recientes/).
+            for path in sitemap.leaf_children("/Recientes"):
+                name = path.rsplit("/", 1)[-1]
+                if re.search(r"(?i)(?:^|[.\s_-])s\d{1,2}(?:[.\s_-]|$)|season|temporada|cap[ií]tulo", name):
+                    series_pool.append(path)
+                else:
+                    movie_pool.append(path)
+
+        # Respaldo: si el árbol no trajo nada, usar las tarjetas de fila.
+        if not movie_pool:
+            movie_pool = [c.url for c in movie_cards]
+        if not series_pool:
+            series_pool = [c.url for c in series_cards]
+
+        random.shuffle(movie_pool)
+        random.shuffle(series_pool)
+        chosen: list[str] = []
+        turn_movie = True
+        while len(chosen) < limit and (movie_pool or series_pool):
+            pool = movie_pool if (turn_movie and movie_pool) or not series_pool else series_pool
+            turn_movie = not turn_movie
+            url = pool.pop()
+            if url not in chosen:
+                chosen.append(url)
+
+        cards: list[CardData] = []
+        for url in chosen:
+            name = unquote(urlparse(url).path.rstrip("/").rsplit("/", 1)[-1])
+            cards.append(self._card_for_entry(Entry(name=name, url=url, is_dir=True)))
+        return cards
 
     def _card_for_entry(self, entry: Entry) -> CardData:
         """CardData de una entrada del listado, usando el caché de
@@ -1340,6 +1471,8 @@ class MainWindow(QMainWindow):
         self.home_view.set_structure(structure["rows"], structure["hero"])
         self._home_built_at = time.time()
         self.status_label.setText("")
+        if self._pending_fav_scroll:
+            QTimer.singleShot(0, self._scroll_to_favorites)
 
         # Pósters de todas las tarjetas (las carpetas resuelven solas con
         # los nombres típicos de Kodi; los videos necesitan listar su
@@ -1430,7 +1563,16 @@ class MainWindow(QMainWindow):
 
     def _enrich_home_bg(self, api_key: str, targets: list[tuple[str, str]]):
         for url, title in targets:
-            media_type = "tv" if "/series" in urlparse(url).path.lower() else "movie"
+            path_lower = urlparse(url).path.lower()
+            name_lower = path_lower.rstrip("/").rsplit("/", 1)[-1]
+            # Series fuera de /Series (p. ej. carpetas en Recientes con
+            # "S02" o "Temporada"): que TMDb busque como serie, no como
+            # película — antes esas fichas no encontraban nada.
+            is_series = "/series" in path_lower or bool(re.search(
+                r"(?:^|[.\s_-])s\d{1,2}(?:$|[.\s_-])|season|temporada",
+                name_lower,
+            ))
+            media_type = "tv" if is_series else "movie"
             year = parse_year(title)
             clean = re.sub(r"\s*\(\d{4}\)\s*$", "", title).strip()
             info, _error = tmdb.fetch_media_info(
@@ -1960,7 +2102,6 @@ class MainWindow(QMainWindow):
         self._save_current_progress()
         self.player.shutdown()
         self.music_bar.shutdown()
-        self.catalog.cancel()
         self.downloads.shutdown()
         self.thumbnails.shutdown()
         self.audio_metadata.shutdown()

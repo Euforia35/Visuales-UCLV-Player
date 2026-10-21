@@ -250,7 +250,7 @@ class HomeView(QWidget):
     detail_requested = Signal(str)        # abrir vista detalle de carpeta
     refresh_requested = Signal()
 
-    ROW_ORDER = ["continue", "movies", "series", "kids", "recent", "favorites"]
+    ROW_ORDER = ["favorites", "continue", "movies", "series", "kids", "recent"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -265,6 +265,7 @@ class HomeView(QWidget):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
+        self.scroll = scroll
         outer.addWidget(scroll)
 
         content = QWidget()
@@ -296,6 +297,12 @@ class HomeView(QWidget):
     def show_loading(self, text: str = "Cargando catálogo…"):
         self.loading_label.setText(text)
         self.loading_label.setVisible(True)
+
+    def scroll_to_row(self, key: str):
+        """Baja hasta una fila del home (por ejemplo, Favoritos)."""
+        row = self._rows.get(key)
+        if row is not None:
+            self.scroll.ensureWidgetVisible(row, 0, 20)
 
     def set_structure(self, rows: list[tuple[str, str, list[CardData]]], hero: list[CardData]):
         """rows: [(row_key, título, [CardData…])]; hero: ítems del banner."""

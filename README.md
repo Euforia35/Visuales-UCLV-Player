@@ -1,30 +1,46 @@
 # Visuales UCLV — Cliente de escritorio para macOS
 
 App nativa (doble clic, sin navegador) para explorar y reproducir en
-streaming el contenido de `visuales.uclv.cu`. Reproduce con **mpv**
-(soporta mp4, mkv, avi, etc.), recuerda dónde quedaste en cada video,
-muestra carátulas en vista de grilla, y permite descargar archivos con
-progreso.
+streaming el contenido de `visuales.uclv.cu`. Reproduce con **mpv
+embebido en la propia ventana** (soporta mp4, mkv, avi, etc.), recuerda
+dónde quedaste en cada video, muestra carátulas en vista de grilla, y
+permite descargar archivos con progreso.
 
 ## Cómo funciona el video (importante)
 
-mpv corre como **proceso aparte** de la app (igual que si escribieras
-`mpv archivo.mp4` en la terminal) y se controla por control remoto vía
-su socket IPC. El video aparece en **una ventana propia de mpv**, no
-dentro de la ventana de la app — tus controles (play/pausa, seek,
-volumen) viven en el panel de la app y manejan esa ventana desde afuera.
+El video se reproduce **dentro de la misma ventana de la app**, en el
+panel central del reproductor, con los controles debajo. Eso se logra
+con **libmpv + render API OpenGL** (`mpv_embedded.py`): la librería de
+mpv dibuja cada cuadro en un `QOpenGLWidget` de Qt — el mismo enfoque
+que usan clientes nativos como IINA. No hay ventana aparte ni proceso
+de mpv separado.
 
-Se hizo así después de varias vueltas: embeber el video directamente
-dentro de la ventana de Qt resultaba en crashes intermitentes en
-macOS, porque tanto Qt como el backend de video de mpv necesitan
-manejar la cola de eventos de Cocoa desde el hilo principal, y al
-correr los dos DENTRO del mismo proceso terminan peleando por eso. Con
-mpv en su propio proceso, cada uno tiene su propia cola de eventos y
-no hay conflicto posible.
+Nota histórica: versiones anteriores intentaron embeber con `--wid` y
+daban crashes intermitentes. En macOS `--wid` ni siquiera está
+soportado (el manual de mpv solo lo documenta para X11, win32 y
+Android): por eso ahora se usa el render API, donde mpv no crea su
+propia ventana y no hay dos colas de eventos de Cocoa compitiendo.
 
-Por esto ya **no hace falta `python-mpv` ni `libmpv`** como dependencia
-de Python — solo el programa `mpv` (el mismo que instala
-`brew install mpv`), así que la instalación es más simple.
+- `brew install mpv` instala tanto el binario `mpv` como `libmpv`, así
+  que no hace falta ninguna dependencia extra de Python.
+- Si `libmpv` no está disponible, la app **cae sola** al modo de
+  siempre (mpv como proceso aparte, controlando por socket IPC, con el
+  video en su propia ventana).
+- Para forzar el modo externo a propósito:
+
+  ```bash
+  VISUALES_PLAYER=external python3 main.py
+  ```
+
+- Si tenés libmpv en otra ruta (instalación rara de Homebrew):
+
+  ```bash
+  VISUALES_LIBMPV=/ruta/a/libmpv.dylib python3 main.py
+  ```
+
+- Atajos en el reproductor: **Espacio** play/pausa, **←/→** ±10s,
+  **F** pantalla completa (de la app), **Esc** salir de pantalla
+  completa.
 
 ## Forma más fácil de correrla: `run.sh`
 
@@ -61,9 +77,14 @@ python3 main.py
 ## Uso
 
 - La app abre en la **pantalla de Inicio** estilo plataforma de streaming:
-  un banner principal rotatorio y filas horizontales (Continuar viendo,
-  Películas, Series, Infantiles, Agregados recientemente, Favoritos) con
-  carátulas y ficha de TMDb.
+  un banner principal rotatorio y filas horizontales (**Favoritos**,
+  Continuar viendo, Películas, Series, Infantiles, Agregados
+  recientemente) con carátulas y ficha de TMDb.
+- El **hero** (banner grande) se arma al azar en cada carga con una
+  mezcla de **películas y series recientes**: prioriza las carpetas por
+  año (`Peliculas/Extranjeras/2026`, `2025`, `2024`…), series con año
+  reciente en el nombre y lo que el servidor publica en `Recientes/`.
+  Ya no se concentra en `Peliculas/Cubanas`.
 - El Inicio se arma con el **árbol de carpetas que el propio servidor
   publica** en `https://visuales.uclv.cu/listado.html` (generado con
   `tree`, ~30.000 carpetas). Un solo archivo da el esqueleto completo del
@@ -73,10 +94,11 @@ python3 main.py
   solo cada 7 días).
 - **Búsqueda global**: el buscador de arriba filtra la carpeta actual
   mientras escribís, pero si apretás **Enter** (o el botón 🔍 al lado)
-  busca por título en TODO el servidor, no solo donde estás parado.
-  La primera vez indexa todo el sitio en segundo plano (puede tardar
-  según el tamaño), y después queda cacheado — "🔄 Reindexar" si se
-  agregó contenido nuevo y querés actualizarlo.
+  busca por título en TODO el servidor usando ese mismo árbol de
+  `listado.html` — es **instantánea**, no indexa ni recorre carpetas por
+  red. Los resultados son carpetas; al elegir una, la app navega hasta
+  ella. "🔄 Actualizar índice" vuelve a descargar el `listado.html` por
+  si se agregó contenido nuevo.
 - Doble clic en una carpeta → entra. Si la carpeta tiene un video o es una
   carpeta "hoja" (videos sin más subcarpetas), se abre automáticamente una
   **vista de detalle estilo Netflix** (carátula, sinopsis, botón grande de
@@ -84,11 +106,14 @@ python3 main.py
   crudo con el botón "📁 Ver todos los archivos" (útil para ver subtítulos
   sueltos, extras, etc.). Doble clic directo en un archivo de video reproduce.
 - Clic derecho sobre un archivo → reproducir, descargar, u olvidar progreso.
-- La navegación principal está en la **barra superior**: el menú
-  **"Explorar ▾"** reúne Inicio, Historial y las categorías (Películas,
-  Series, Infantiles), así el contenido aprovecha todo el ancho.
+- La navegación principal está en la **barra superior**: hacer clic en el
+  logo **VISUALES UCLV** (izquierda superior) va a Inicio, y el menú
+  **"Explorar ▾"** reúne **⭐ Favoritos**, Historial y las categorías
+  (Películas, Series, Infantiles), así el contenido aprovecha todo el ancho.
 - Botón ☆ arriba a la derecha → marca la carpeta actual como favorita y
-  despliega la lista de favoritos para ir directo a ellos.
+  despliega la lista de favoritos para ir directo a ellos. Los favoritos
+  también aparecen como **primera fila del Inicio** y en el menú
+  "Explorar ▾" (que baja directo hasta esa fila).
 - Botón "🖼 Vista grilla" → cambia el listado de archivos (no la vista
   de detalle) a una grilla con carátulas. Como descarga imágenes, si tu
   conexión es lenta o costosa conviene dejarlo en vista de lista.
@@ -229,8 +254,10 @@ Applications, como cualquier instalador de Mac.
 > **La única dependencia que sigue haciendo falta en la Mac destino es
 > `mpv`** (`brew install mpv`) — es un programa aparte, no una
 > librería de Python, así que `py2app` no puede meterlo adentro del
-> bundle. Es un solo comando, mucho más liviano que pedirle a alguien
-> que instale Python + todo lo demás.
+> bundle. Esa misma instalación trae `libmpv` (la que usa el
+> reproductor embebido) y el binario `mpv` (el fallback); es un solo
+> comando, mucho más liviano que pedirle a alguien que instale
+> Python + todo lo demás.
 
 > **Aviso honesto:** no tengo forma de probar `hdiutil` ni el armado
 > final del `.dmg` desde donde te escribo (son herramientas exclusivas
@@ -245,8 +272,11 @@ run.sh              → arranque con auto-instalación de todo
 main.py             → punto de entrada
 theme.py            → tokens de diseño + generación del QSS (tema oscuro)
 apache_index.py     → parser del listado "Index of /..." de Apache
-sitemap.py          → árbol de carpetas del sitio (listado.html), cacheado
-player.py           → reproductor embebido con mpv + controles
+sitemap.py          → árbol de carpetas del sitio (listado.html), cacheado,
+                       búsqueda instantánea por título
+player.py           → página de reproducción: video embebido + controles
+mpv_embedded.py     → reproductor libmpv render API (QOpenGLWidget);
+                       fallback a mpv externo si libmpv falta
 progress.py         → guarda el punto de reproducción (resume)
 thumbnails.py        → busca/descarga carátulas/backdrops (cache en disco)
 downloads.py         → gestor de descargas en segundo plano

@@ -1,8 +1,9 @@
 """
 search_dialog.py
 -----------------
-Diálogo de búsqueda global: busca en un índice cacheado de todo el
-servidor (catalog.SiteCatalog) en vez de solo la carpeta actual.
+Diálogo de búsqueda global: busca en el árbol de carpetas que publica
+el servidor en `listado.html` (sitemap.SiteMap), sin recorrer carpetas
+por red ni mantener un índice aparte.
 """
 
 from __future__ import annotations
@@ -50,8 +51,10 @@ class GlobalSearchDialog(QDialog):
         layout.addWidget(self.results_list, stretch=1)
 
         bottom_row = QHBoxLayout()
-        self.reindex_btn = QPushButton("🔄 Reindexar todo el servidor")
-        self.reindex_btn.setToolTip("Vuelve a recorrer todo el sitio desde cero (por si se agregó contenido nuevo)")
+        self.reindex_btn = QPushButton("🔄 Actualizar índice")
+        self.reindex_btn.setToolTip(
+            "Vuelve a descargar listado.html (por si se agregó contenido nuevo)"
+        )
         self.reindex_btn.clicked.connect(self.reindex_requested.emit)
         bottom_row.addWidget(self.reindex_btn)
         bottom_row.addStretch(1)
@@ -74,14 +77,14 @@ class GlobalSearchDialog(QDialog):
             item.setData(Qt.UserRole, r)
             self.results_list.addItem(item)
 
-    def set_indexing_status(self, count: int, current_path: str):
-        short_path = current_path if len(current_path) < 60 else "…" + current_path[-57:]
-        self.status_label.setText(f"⏳ Indexando… {count} elementos encontrados ({short_path})")
-        self.reindex_btn.setEnabled(False)
+    def set_status(self, text: str):
+        self.status_label.setText(text)
 
     def set_index_ready(self, count: int):
         self.reindex_btn.setEnabled(True)
-        self.status_label.setText(f"Índice listo: {count} elementos. Escribí para buscar.")
+        self.status_label.setText(
+            f"Índice listo: {count:,} carpetas del servidor. Escribí para buscar.".replace(",", ".")
+        )
         if self._pending_query:
             self._request_search()
 

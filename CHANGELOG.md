@@ -1,5 +1,37 @@
 # Changelog — Visuales UCLV
 
+## 1.8.0
+- **Reproductor embebido**: el video ahora se reproduce **dentro de la
+  ventana de la app** (panel central del reproductor), con los
+  controles debajo — sin ventana aparte de mpv. Se implementó con
+  **libmpv + render API OpenGL** sobre un `QOpenGLWidget`
+  (`mpv_embedded.py`), el mismo enfoque que clientes nativos como
+  IINA. El camino viejo de `--wid` no existe en macOS; el render API
+  evita además el problema histórico de las dos colas de eventos de
+  Cocoa. Si libmpv no está disponible, la app cae automáticamente al
+  mpv externo por IPC (o se fuerza con `VISUALES_PLAYER=external`).
+  Nuevos atajos: Espacio (play/pausa), ←/→ (±10s), F (pantalla
+  completa de la app), Esc (salir).
+- **Hero del Inicio aleatorio y reciente**: el banner ya no sale casi
+  siempre de `Peliculas/Cubanas`. Ahora se arma un pool ponderado por
+  año (películas de `Extranjeras/2026`, `2025`, `2024`, `2023`, series
+  con año reciente y lo publicado en `Recientes/`), se mezclan
+  películas y series, y se elige al azar en cada carga del Inicio.
+- **Búsqueda global desde `listado.html`**: la búsqueda por título usa
+  el árbol de carpetas que publica el servidor, así que es instantánea
+  — ya no indexa recursivamente todo el sitio ni mantiene un índice
+  aparte. Los resultados son carpetas; el botón "🔄 Actualizar índice"
+  solo vuelve a descargar el `listado.html`.
+- **Navegación**: "Inicio" salió del menú "Explorar ▾"; ahora se llega
+  haciendo clic en el logo **VISUALES UCLV** de la barra superior.
+- **Favoritos**: nueva entrada "⭐ Favoritos" en el menú "Explorar ▾"
+  (baja hasta la fila) y fila de Favoritos como **primera fila del
+  Inicio**.
+- El arranque del reproductor embebido ajusta `LC_NUMERIC=C` (sin eso
+  libmpv puede hacer SIGSEGV en macOS) y la app sale con `os._exit` al
+  cerrar, para no quedarse colgada esperando descargas de portadas en
+  segundo plano.
+
 ## 1.7.0
 - **Elegir subtítulos de la carpeta (pop-up)**: al abrir un video,
   si la carpeta tiene archivos de subtítulo (`.srt`, `.sub`, `.ass`,

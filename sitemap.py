@@ -20,15 +20,29 @@ tener que recorrer el servidor.
 
 from __future__ import annotations
 
+import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote
 
 from bs4 import BeautifulSoup
+
+from naming import clean_display_title
 
 SITEMAP_NAME = "listado.html"
 # El árbol cambia poco; lo refrescamos cada tanto (7 días).
 STALE_AFTER_SECONDS = 7 * 24 * 3600
+
+
+@dataclass
+class SiteEntry:
+    """Resultado de búsqueda dentro del árbol de carpetas."""
+
+    name: str
+    url: str
+    parent_path: str
+    is_dir: bool = True
 
 
 class SiteMap:
@@ -55,7 +69,7 @@ class SiteMap:
             return False
         self.built_at = data.get("built_at", 0.0)
         self.paths = set(data.get("paths", []))
-        self._children.clear()
+        self._rebuild_children()
         return bool(self.paths)
 
     def is_stale(self) -> bool:
@@ -90,7 +104,7 @@ class SiteMap:
         if not paths:
             return False
         self.paths = paths
-        self._children.clear()
+        self._rebuild_children()
         self.built_at = time.time()
         self._save_to_disk()
         return True
@@ -122,17 +136,22 @@ class SiteMap:
             self.fetch()
         return bool(self.paths)
 
+    def _rebuild_children(self):
+        """Índice padre → hijos directos (una sola pasada por las
+        ~30.000 rutas, en vez de filtrar todo el set en cada consulta)."""
+        self._children.clear()
+        for path in self.paths:
+            parent = path.rsplit("/", 1)[0]
+            self._children.setdefault(parent, []).append(path)
+        for kids in self._children.values():
+            kids.sort()
+
     def children(self, path: str) -> list[str]:
         """Rutas hijas directas de `path`."""
         path = path.rstrip("/")
-        if path in self._children:
-            return self._children[path]
-        depth = path.count("/")
-        kids = [p for p in self.paths
-                if p.startswith(path + "/") and p.count("/") == depth + 1]
-        kids.sort()
-        self._children[path] = kids
-        return kids
+        if not self._children and self.paths:
+            self._rebuild_children()
+        return self._children.get(path, [])
 
     def leaf_children(self, path: str) -> list[str]:
         """Hijos directos que son hojas (sin subcarpetas): candidatos a
@@ -140,30 +159,118 @@ class SiteMap:
         return [c for c in self.children(path) if not self.children(c)]
 
     def content_folders(self, root: str, limit: int = 30) -> list[str]:
-        """Carpetas \"de contenido\" dentro de `root`, bajando por los
-        niveles que solo agrupan (sus hijos no son hojas) hasta dar con
-        carpetas que sí contienen elementos individuales.
+        """Carpetas \"de contenido\" dentro de `root`, repartiendo el
+        cupo entre las subcategorías de primer nivel.
 
-        Devuelve rutas completas, en orden estable."""
+        Antes se hacía un BFS que se llenaba con la primera carpeta
+        grande (Peliculas/Cubanas, Series/Espanol…), así que las filas
+        del home mostraban siempre lo mismo. Ahora se toma una cuota de
+        cada grupo y, dentro de los grupos por año (Extranjeras/2024,
+        2025…), se empieza por los años más recientes."""
         root = root.rstrip("/")
+        groups = [c for c in self.children(root) if self.children(c)]
+        if not groups:
+            return self.leaf_children(root)[:limit]
+
+        # Cuota por grupo (si un grupo no llega a la cuota, el resto se
+        # completa con los demás al final).
+        per_group = max(1, limit // len(groups))
         results: list[str] = []
-        # BFS acotado: primero lo más cercano a la raíz
-        queue = [root]
-        visited = {root}
+        for group in groups:
+            results.extend(self._leaves_under(group, per_group))
+            if len(results) >= limit:
+                break
+
+        if len(results) < limit:
+            for group in groups:
+                for leaf in self._leaves_under(group, per_group * 2):
+                    if leaf not in results:
+                        results.append(leaf)
+                        if len(results) >= limit:
+                            break
+                if len(results) >= limit:
+                    break
+        return results[:limit]
+
+    def _leaves_under(self, path: str, limit: int) -> list[str]:
+        """Hojas debajo de `path` (BFS acotado). Si `path` contiene
+        subcarpetas con nombre de año (1900s, 2024…), las recorre de la
+        más nueva a la más vieja."""
+        results: list[str] = []
+        queue = [path]
+        visited = {path}
         while queue and len(results) < limit:
             current = queue.pop(0)
             kids = self.children(current)
             if not kids:
+                results.append(current)
                 continue
-            leaves = [c for c in kids if not self.children(c)]
-            # Si la mayoría de los hijos son hojas, ESTE nivel ya es
-            # el de contenido (sus hijos son las películas/series).
-            if len(leaves) >= max(3, len(kids) // 2):
-                results.extend(leaves)
+            for kid in self._sort_kids(kids):
+                if kid not in visited:
+                    visited.add(kid)
+                    queue.append(kid)
+        return results
+
+    @staticmethod
+    def _year_group_value(name: str) -> int | None:
+        """1900s → 1900, 2024 → 2024, 18xxs → 1800; None si no es año."""
+        m = re.fullmatch(r"((?:18|19|20)\d{2})s?", name)
+        if m:
+            return int(m.group(1))
+        m = re.fullmatch(r"(\d{2})xxs", name)
+        if m:
+            return int(m.group(1)) * 100
+        return None
+
+    @classmethod
+    def _sort_kids(cls, kids: list[str]) -> list[str]:
+        """Ordena hijos dejando primero los años/décadas más recientes."""
+        # Solo cambiamos el orden si TODOS los hijos parecen años;
+        # en una lista de series alfabética no queremos invertir nada.
+        if kids and all(
+            cls._year_group_value(k.rsplit("/", 1)[-1]) is not None for k in kids
+        ):
+            return sorted(
+                kids,
+                key=lambda p: (
+                    -cls._year_group_value(p.rsplit("/", 1)[-1]),
+                    p,
+                ),
+            )
+        return sorted(kids)
+
+    # ------------------------------------------------------------------
+    # Búsqueda por título en el árbol cacheado
+    # ------------------------------------------------------------------
+    def search(self, query: str, limit: int = 120) -> list[SiteEntry]:
+        """Busca por nombre de carpeta en TODO el sitio, usando el
+        índice de `listado.html` (sin recorrer carpetas por red)."""
+        query = query.strip().casefold()
+        if not query:
+            return []
+        hits: list[tuple[tuple, str, str]] = []
+        for path in self.paths:
+            raw_name = path.rsplit("/", 1)[-1]
+            name = unquote(raw_name)
+            if query not in name.casefold():
                 continue
-            # Si no, es un nivel de agrupación: bajamos por los hijos.
-            for c in kids:
-                if c not in visited:
-                    visited.add(c)
-                    queue.append(c)
-        return results[:limit]
+            is_leaf = not self.children(path)
+            exact_start = 0 if name.casefold().startswith(query) else 1
+            # Carpetas de contenido (hojas) primero; los agrupadores
+            # ("Cubanas", "Extranjeras", "Ingles") quedan después.
+            score = (exact_start, 0 if is_leaf else 1, len(name), name.casefold())
+            hits.append((score, path, name))
+        hits.sort(key=lambda h: h[0])
+
+        results: list[SiteEntry] = []
+        for _score, path, name in hits[:limit]:
+            parent = path.rsplit("/", 1)[0]
+            parent_label = "Inicio" + "".join(
+                f"  ›  {unquote(part)}" for part in parent.split("/") if part
+            )
+            results.append(SiteEntry(
+                name=clean_display_title(name) or name,
+                url=self.base_url + quote(path.lstrip("/"), safe="/") + "/",
+                parent_path=parent_label,
+            ))
+        return results

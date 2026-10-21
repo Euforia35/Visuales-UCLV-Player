@@ -1,23 +1,29 @@
 """
 player.py
 ---------
-Widget de "control remoto" para mpv. mpv corre como PROCESO APARTE
-(ver mpv_ipc.py) — abre su propia ventana nativa de video, totalmente
-independiente del proceso de la app. Este widget solo manda comandos
-(play/pausa/seek/volumen/subtítulos/pantalla completa) y muestra el
-progreso recibido por el socket IPC.
+Página de reproducción. Por defecto usa el reproductor **embebido**
+(libmpv dentro de la app, ver ``mpv_embedded.py``): el video se ve en el
+panel central, con los controles debajo.
+
+Si libmpv no está disponible (o se fuerza con ``VISUALES_PLAYER=external``),
+cae al modo histórico: mpv corre como PROCESO APARTE (ver ``mpv_ipc.py``)
+y abre su propia ventana; este widget solo manda comandos por IPC.
 """
 
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QShortcut, QKeySequence
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QSlider, QLabel, QPushButton
+    QWidget, QVBoxLayout, QHBoxLayout, QSlider, QLabel, QPushButton,
+    QStackedWidget,
 )
 
 from mpv_ipc import MpvIPCPlayer, find_mpv_binary
+from mpv_embedded import EmbeddedMpvPlayer, embedded_available
 
 MPV_AVAILABLE = find_mpv_binary() is not None
+EMBEDDED_AVAILABLE = embedded_available()
 
 
 def _fmt_time(seconds: float) -> str:
@@ -32,7 +38,7 @@ def _fmt_time(seconds: float) -> str:
 
 
 class PlayerWidget(QWidget):
-    """Panel de control remoto para la ventana de video de mpv."""
+    """Página de reproducción (video embebido o ventana externa de mpv)."""
 
     error_occurred = Signal(str)
     track_finished = Signal()  # el video llegó al final de verdad (no pausa)
@@ -40,7 +46,11 @@ class PlayerWidget(QWidget):
     folder_subtitles_requested = Signal()  # elegir un sub. de la carpeta del video
     _pause_state_signal = Signal(bool)  # puente hilo IPC -> hilo GUI
 
-    IDLE_TEXT = (
+    IDLE_TEXT_EMBEDDED = (
+        "🎬 El video se reproduce dentro de la app.\n"
+        "Elegí una película o un episodio para empezar."
+    )
+    IDLE_TEXT_EXTERNAL = (
         "🎬 El video se abre en una ventana aparte de mpv.\n"
         "Usá estos controles para manejarlo desde acá, o los atajos "
         "normales de mpv (espacio para pausar, flechas para saltar)."
@@ -50,7 +60,7 @@ class PlayerWidget(QWidget):
         super().__init__(parent)
         self._duration = 0.0
         self._seeking = False
-        self._mpv: MpvIPCPlayer | None = None
+        self._mpv = None
         self._current_title = ""
         self.current_url: str | None = None
         self._pending_start_at = 0.0
@@ -58,12 +68,32 @@ class PlayerWidget(QWidget):
         self._eof_callback_registered = False
         self._seek_callback_registered = False
 
+        # Backend embebido por defecto; si algo falla, se usa el externo.
+        self._embedded = EMBEDDED_AVAILABLE
+        self.video: EmbeddedMpvPlayer | None = None
+        if self._embedded:
+            try:
+                self.video = EmbeddedMpvPlayer(self)
+                self.video.error_occurred.connect(self.error_occurred)
+                self.video.track_finished.connect(self.track_finished)
+                self.video.pause_changed.connect(self._on_pause_changed)
+                self.video.on_event("end-file", self._on_end_file)
+                self.video.on_event("file-loaded", self._on_embedded_file_loaded)
+                self._mpv = self.video
+            except Exception:
+                self._embedded = False
+                self.video = None
+        self._idle_text = (
+            self.IDLE_TEXT_EMBEDDED if self._embedded else self.IDLE_TEXT_EXTERNAL
+        )
+
         self._build_ui()
         self._pause_state_signal.connect(self._on_pause_changed)
+        self._install_shortcuts()
 
-        if not MPV_AVAILABLE:
+        if not (self._embedded or MPV_AVAILABLE):
             self.info_label.setText(
-                "No se encontró el programa 'mpv'. Instalalo con:\n"
+                "No se encontró mpv. Instalalo con:\n"
                 "brew install mpv\n"
                 "y reiniciá la app."
             )
@@ -72,16 +102,33 @@ class PlayerWidget(QWidget):
     # ------------------------------------------------------------------
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(10)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        self.info_label = QLabel(self.IDLE_TEXT)
+        # --- Escenario: video embebido o cartel de estado --------------
+        self.stage = QStackedWidget()
+        self.stage.setObjectName("playerStage")
+
+        self.idle_page = QWidget()
+        idle_layout = QVBoxLayout(self.idle_page)
+        idle_layout.setContentsMargins(20, 20, 20, 20)
+        self.info_label = QLabel(self._idle_text)
         self.info_label.setObjectName("nowPlayingLabel")
         self.info_label.setWordWrap(True)
         self.info_label.setAlignment(Qt.AlignCenter)
-        layout.addStretch(1)
-        layout.addWidget(self.info_label)
+        idle_layout.addStretch(1)
+        idle_layout.addWidget(self.info_label)
+        idle_layout.addStretch(1)
+        self.stage.addWidget(self.idle_page)
 
+        if self.video is not None:
+            self.stage.addWidget(self.video)
+            self.stage.setCurrentWidget(self.video)
+        else:
+            self.stage.setCurrentWidget(self.idle_page)
+        layout.addWidget(self.stage, stretch=1)
+
+        # --- Controles -------------------------------------------------
         controls = QWidget(self)
         controls.setObjectName("playerControls")
         c_layout = QVBoxLayout(controls)
@@ -141,7 +188,8 @@ class PlayerWidget(QWidget):
         self.fullscreen_btn = QPushButton("⛶ Pantalla completa")
         self.fullscreen_btn.clicked.connect(self._toggle_fullscreen)
 
-        for w in (self.play_btn, self.stop_btn, self.back10_btn, self.fwd10_btn, self.sub_btn, self.folder_subs_btn, self.online_subs_btn):
+        for w in (self.play_btn, self.stop_btn, self.back10_btn, self.fwd10_btn,
+                  self.sub_btn, self.folder_subs_btn, self.online_subs_btn):
             btn_row.addWidget(w)
         btn_row.addStretch(1)
         btn_row.addWidget(QLabel("🔊"))
@@ -150,12 +198,24 @@ class PlayerWidget(QWidget):
         c_layout.addLayout(btn_row)
 
         layout.addWidget(controls)
-        layout.addStretch(1)
 
         self._ui_timer = QTimer(self)
         self._ui_timer.setInterval(400)
         self._ui_timer.timeout.connect(self._refresh_ui)
         self._ui_timer.start()
+
+    def _install_shortcuts(self):
+        def shortcut(key, handler):
+            sc = QShortcut(QKeySequence(key), self)
+            sc.setContext(Qt.WidgetWithChildrenShortcut)
+            sc.activated.connect(handler)
+            return sc
+
+        self._sc_space = shortcut(Qt.Key_Space, self.toggle_pause)
+        self._sc_left = shortcut(Qt.Key_Left, lambda: self.seek_relative(-10))
+        self._sc_right = shortcut(Qt.Key_Right, lambda: self.seek_relative(10))
+        self._sc_full = shortcut(Qt.Key_F, self._toggle_fullscreen)
+        self._sc_esc = shortcut(Qt.Key_Escape, self._exit_fullscreen)
 
     def _set_controls_enabled(self, enabled: bool):
         for w in (
@@ -167,6 +227,8 @@ class PlayerWidget(QWidget):
 
     # ------------------------------------------------------------------
     def _ensure_mpv(self) -> bool:
+        if self._embedded:
+            return True
         if self._mpv and self._mpv.is_running():
             return True
         if not MPV_AVAILABLE:
@@ -179,16 +241,58 @@ class PlayerWidget(QWidget):
         self._seek_callback_registered = False
         return True
 
+    def _use_external_fallback(self) -> bool:
+        """Si libmpv falla al arrancar, intenta el mpv externo."""
+        if not MPV_AVAILABLE:
+            return False
+        self._embedded = False
+        self._mpv = None
+        self._idle_text = self.IDLE_TEXT_EXTERNAL
+        self.info_label.setText(self._idle_text)
+        self.stage.setCurrentWidget(self.idle_page)
+        return True
+
     # ------------------------------------------------------------------
-    def play(self, url: str, title: str = "", start_at: float = 0.0, subtitle_urls: list | None = None):
-        if not self._ensure_mpv():
+    def play(self, url: str, title: str = "", start_at: float = 0.0,
+             subtitle_urls: list | None = None):
+        if not (self._embedded or self._ensure_mpv()):
             return
         self._current_title = title or url
         self.current_url = url
-        self.info_label.setText(f"🎬 Reproduciendo en la ventana de mpv:\n{self._current_title}")
         self._paused = False
         self.play_btn.setText("⏸")
         self._pending_start_at = 0.0
+
+        if self._embedded and self.video is not None:
+            self.stage.setCurrentWidget(self.video)
+            self.video.setFocus(Qt.OtherFocusReason)
+            self.info_label.setText(f"🎬 Reproduciendo:\n{self._current_title}")
+            already_running = self.video.is_running()
+            ok = self.video.load(url) if already_running else self.video.start(url)
+            if not ok:
+                if self._use_external_fallback():
+                    self.play(url, title, start_at=start_at,
+                              subtitle_urls=subtitle_urls)
+                else:
+                    self.stage.setCurrentWidget(self.idle_page)
+                    self.error_occurred.emit(
+                        "No se pudo iniciar el reproductor embebido.\n\n"
+                        "Detalle: " + (self.video.last_error() or "desconocido")
+                    )
+                return
+            if subtitle_urls:
+                for i, sub_url in enumerate(subtitle_urls):
+                    self.video.add_subtitle(sub_url, select=(i == 0))
+            if start_at and start_at > 1:
+                self._pending_start_at = start_at
+                # El evento file-loaded lo aplica (ver _on_embedded_file_loaded).
+            return
+
+        # --- Backend externo (ventana de mpv aparte) -------------------
+        self.stage.setCurrentWidget(self.idle_page)
+        self.info_label.setText(
+            f"🎬 Reproduciendo en la ventana de mpv:\n{self._current_title}"
+        )
 
         already_running = self._mpv.is_running()
         if already_running:
@@ -225,17 +329,22 @@ class PlayerWidget(QWidget):
             self._pending_start_at = start_at
             self._arm_resume_seek()
 
+    def _on_embedded_file_loaded(self):
+        if self._pending_start_at and self._pending_start_at > 1:
+            self.video.seek(self._pending_start_at, absolute=True)
+            self._pending_start_at = 0.0
+
     def _on_pause_changed(self, value):
-        # Si el usuario pausa/reanuda desde la propia ventana de mpv, el
-        # botón de la app tiene que reflejarlo (antes solo cambiaba al
+        # Si el usuario pausa/reanuda desde el propio video o desde mpv,
+        # el botón de la app tiene que reflejarlo (antes solo cambiaba al
         # usar el botón de acá).
         paused = bool(value)
         self._paused = paused
         self.play_btn.setText("▶" if paused else "⏸")
 
     def _on_end_file(self, msg: dict):
-        # Corre en el hilo lector del socket IPC (no el de la GUI);
-        # emitir una señal de Qt desde acá es seguro (se encola solo).
+        # Puede correr en el hilo lector del socket IPC o en el hilo de
+        # eventos de libmpv; emitir una señal de Qt desde ahí es seguro.
         if msg.get("reason") == "error":
             self.error_occurred.emit(
                 "mpv no pudo cargar este video.\n\n"
@@ -246,9 +355,7 @@ class PlayerWidget(QWidget):
             )
 
     def _on_eof_reached(self, value):
-        # Corre en el hilo lector del socket IPC (no el hilo de la GUI).
-        # Emitir una señal de Qt desde otro hilo es seguro: se entrega
-        # encolada al hilo principal automáticamente.
+        # Corre en el hilo lector del socket IPC (modo externo).
         if value:
             self.track_finished.emit()
 
@@ -286,11 +393,18 @@ class PlayerWidget(QWidget):
         self.play_btn.setText("▶" if self._paused else "⏸")
 
     def stop(self):
-        """Detiene la reproducción y cierra la ventana de mpv."""
+        """Detiene la reproducción y vuelve al cartel de inicio."""
         if self._mpv:
             self._mpv.terminate()
+        if self._embedded and self.video is not None:
+            self._mpv = self.video
+            self.stage.setCurrentWidget(self.idle_page)
+        elif self._embedded:
+            self.stage.setCurrentWidget(self.idle_page)
+        else:
             self._mpv = None
-        self.info_label.setText(self.IDLE_TEXT)
+            self.stage.setCurrentWidget(self.idle_page)
+        self.info_label.setText(self._idle_text)
         self.seek_slider.setValue(0)
         self.time_label.setText("0:00")
         self.duration_label.setText("0:00")
@@ -330,8 +444,8 @@ class PlayerWidget(QWidget):
     def replace_subtitles(self, urls: list[str]):
         """Carga los subtítulos elegidos por el usuario en el pop-up,
         dejando el primero como pista activa. Las pistas que ya estaban
-        cargadas (carga automática) no se pueden listar/borrar por IPC
-        sin respuestas, así que quedan como alternativas y se pueden
+        cargadas (carga automática) no se pueden listar/borrar sin
+        respuestas, así que quedan como alternativas y se pueden
         ciclar dentro de mpv con j/k."""
         if not (self._mpv and self._mpv.is_running()):
             return
@@ -353,9 +467,23 @@ class PlayerWidget(QWidget):
             self._mpv.set_volume(value)
 
     def _toggle_fullscreen(self):
-        """Pantalla completa de la ventana de mpv (no de la app)."""
+        if self._embedded:
+            win = self.window()
+            if win.isFullScreen():
+                win.showNormal()
+                self.fullscreen_btn.setText("⛶ Pantalla completa")
+            else:
+                win.showFullScreen()
+                self.fullscreen_btn.setText("⛶ Salir de pantalla completa")
+            return
+        # Modo externo: pantalla completa de la ventana de mpv.
         if self._mpv and self._mpv.is_running():
             self._mpv.toggle_fullscreen()
+
+    def _exit_fullscreen(self):
+        if self._embedded and self.window().isFullScreen():
+            self.window().showNormal()
+            self.fullscreen_btn.setText("⛶ Pantalla completa")
 
     def _on_seek_start(self):
         self._seeking = True
@@ -379,6 +507,9 @@ class PlayerWidget(QWidget):
 
     def shutdown(self):
         self._ui_timer.stop()
-        if self._mpv:
+        if self._embedded and self.video is not None:
+            self.video.shutdown()
+            self._mpv = None
+        elif self._mpv:
             self._mpv.terminate()
             self._mpv = None
