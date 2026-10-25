@@ -43,6 +43,14 @@ propia ventana y no hay dos colas de eventos de Cocoa compitiendo.
   completa. Al entrar a pantalla completa se oculta **toda** la
   interfaz (modo cine): los controles vuelven al mover el mouse y se
   esconden solos a los 3 s.
+- Subtítulos por teclado, sin abrir menús: **Shift+↑ / Shift+↓** (o
+  **+ / −**) agrandan/achican el texto y **C** cambia el color. El
+  tamaño y el color se guardan y también se pueden ajustar en
+  **Explorar ▾ → ⚙ Preferencias…**, junto con el colchón de caché del
+  video (5 min / 150 MB por defecto).
+- En carpetas de series, la ficha detecta las temporadas y muestra un
+  desplegable para cambiar de una a otra sin volver al explorador. Al
+  cerrar un episodio regresás a esa misma ficha/temporada.
 
 ## Forma más fácil de correrla: `run.sh`
 

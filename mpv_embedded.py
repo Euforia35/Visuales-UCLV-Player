@@ -32,6 +32,8 @@ from PySide6.QtGui import QColor, QPainter, QSurfaceFormat
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import QSizePolicy
 
+from player_prefs import DEFAULT_CACHE_MAX_MB, DEFAULT_CACHE_SECS
+
 # ---------------------------------------------------------------------------
 # Carga de libmpv
 # ---------------------------------------------------------------------------
@@ -204,7 +206,8 @@ class EmbeddedMpvPlayer(QOpenGLWidget):
     track_finished = Signal()
     pause_changed = Signal(bool)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, cache_secs: int = DEFAULT_CACHE_SECS,
+                 cache_max_mb: int = DEFAULT_CACHE_MAX_MB):
         super().__init__(parent)
         self.setMinimumSize(320, 180)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -212,6 +215,8 @@ class EmbeddedMpvPlayer(QOpenGLWidget):
         self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.setStyleSheet("background: black;")
 
+        self._cache_secs = int(cache_secs)
+        self._cache_max_mb = int(cache_max_mb)
         self._lib = _load_lib(LIBMPV_PATH) if LIBMPV_AVAILABLE else None
         self._handle: int | None = None
         self._render_ctx = c_void_p()
@@ -227,6 +232,12 @@ class EmbeddedMpvPlayer(QOpenGLWidget):
         self._event_stop = threading.Event()
         self._prop_callbacks: dict[str, list] = {}
         self._event_callbacks: dict[str, list] = {}
+        # Valores observados por el hilo de eventos. La GUI los lee de acá
+        # (igual que MpvIPCPlayer) en vez de llamar a mpv_get_property en
+        # cada tick: si el hilo de red de mpv está esperando al servidor,
+        # una consulta desde la GUI podía bloquear el repintado del video.
+        self._properties: dict[str, object] = {}
+        self._props_lock = threading.Lock()
         self._last_eof = False
         self._gl_cleanup_connected = False
         self._self_gl = ctypes.CDLL(None)
@@ -370,9 +381,17 @@ class EmbeddedMpvPlayer(QOpenGLWidget):
             "input-vo-keyboard": "no",
             "terminal": "no",
             "msg-level": "all=warn",
+            # Caché/búfer para streaming remoto (los mismos valores que
+            # usaba el reproductor del MVP): colchón de 5 min y hasta
+            # 150 MiB de demuxer, para que un bache de red no trabe el
+            # video. Se completan en set_cache_options().
             "cache": "yes",
-            "demuxer-max-bytes": "150MiB",
-            "demuxer-readahead-secs": "300",
+            "cache-secs": str(self._cache_secs),
+            "demuxer-readahead-secs": str(self._cache_secs),
+            "demuxer-max-bytes": f"{self._cache_max_mb}MiB",
+            "demuxer-max-back-bytes": f"{self._cache_back_mb()}MiB",
+            "cache-pause": "yes",
+            "cache-pause-wait": "2",
             "network-timeout": "60",
         }
         for key, value in options.items():
@@ -393,12 +412,35 @@ class EmbeddedMpvPlayer(QOpenGLWidget):
             ("pause", MPV_FORMAT_FLAG),
             ("eof-reached", MPV_FORMAT_FLAG),
             ("seekable", MPV_FORMAT_FLAG),
+            ("paused-for-cache", MPV_FORMAT_FLAG),
+            ("core-idle", MPV_FORMAT_FLAG),
+            ("time-pos", MPV_FORMAT_DOUBLE),
+            ("duration", MPV_FORMAT_DOUBLE),
+            ("volume", MPV_FORMAT_DOUBLE),
+            ("cache-buffering-state", MPV_FORMAT_INT64),
         ):
             self._lib.mpv_observe_property(
                 self._handle, 0, name.encode(), fmt
             )
         self._start_event_thread()
         return True
+
+    def _cache_back_mb(self) -> int:
+        # La mitad del búfer total para poder retroceder/seek sin volver
+        # a pedirle todo al servidor.
+        return max(32, self._cache_max_mb // 2)
+
+    def set_cache_options(self, cache_secs: int, cache_max_mb: int):
+        """Cambia el búfer en caliente (se aplica al próximo video y, si
+        mpv ya está inicializado, también al que se está reproduciendo)."""
+        self._cache_secs = max(30, int(cache_secs))
+        self._cache_max_mb = max(32, int(cache_max_mb))
+        if not self._handle:
+            return
+        self._set_property("cache-secs", str(self._cache_secs))
+        self._set_property("demuxer-readahead-secs", str(self._cache_secs))
+        self._set_property("demuxer-max-bytes", f"{self._cache_max_mb}MiB")
+        self._set_property("demuxer-max-back-bytes", f"{self._cache_back_mb()}MiB")
 
     def _start_event_thread(self):
         if self._event_thread and self._event_thread.is_alive():
@@ -447,7 +489,13 @@ class EmbeddedMpvPlayer(QOpenGLWidget):
                         self.track_finished.emit()
                     elif not value:
                         self._last_eof = False
-                elif name == "pause":
+                # Igual que MpvIPCPlayer: si mpv manda "sin dato" (por
+                # ejemplo durante un seek), conservamos el último valor
+                # bueno en vez de pisarlo con None.
+                if value is not None:
+                    with self._props_lock:
+                        self._properties[name] = value
+                if name == "pause":
                     self.pause_changed.emit(bool(value))
                 for callback in list(self._prop_callbacks.get(name, [])):
                     try:
@@ -492,6 +540,7 @@ class EmbeddedMpvPlayer(QOpenGLWidget):
             return False
         self._running = True
         self._last_eof = False
+        self._reset_playback_properties()
         self.show()
         if not self._render_ctx:
             # Todavía no se inicializó el contexto OpenGL: guardamos la
@@ -509,9 +558,28 @@ class EmbeddedMpvPlayer(QOpenGLWidget):
         self._send_load(url)
         return True
 
+    def _reset_playback_properties(self):
+        """Valores iniciales del video nuevo, sin esperar al hilo de eventos.
+
+        La GUI lee solo de este diccionario (nunca llama a mpv desde el
+        hilo principal), así que tiene que haber algo sensato desde el
+        primer tick.
+        """
+        with self._props_lock:
+            self._properties.update({
+                "time-pos": 0.0,
+                "duration": 0.0,
+                "pause": False,
+                "eof-reached": False,
+                "paused-for-cache": False,
+                "core-idle": False,
+            })
+
     def _send_load(self, url: str):
+        self._reset_playback_properties()
         # "replace" corta el video anterior en vez de encolarlo.
         self._command(b"loadfile", url.encode(), b"replace")
+        self._set_property("pause", "no")
 
     def _command(self, *args: bytes):
         if not self._handle:
@@ -546,22 +614,20 @@ class EmbeddedMpvPlayer(QOpenGLWidget):
         flags = b"select" if select else b"auto"
         self._command(b"sub-add", url.encode(), flags)
 
+    def set_property(self, name: str, value):
+        """Interfaz pública equivalente a MpvIPCPlayer.set_property."""
+        self._set_property(name, str(value))
+
+    def show_text(self, text: str, duration_ms: int = 2000):
+        self._command(b"show-text", text.encode(), str(int(duration_ms)).encode())
+
     def get_cached_property(self, name: str, default=None):
-        if not self._handle:
-            return default
-        if name in ("pause", "eof-reached", "seekable", "idle-active"):
-            value = c_int()
-            rc = self._lib.mpv_get_property(
-                self._handle, name.encode(), MPV_FORMAT_FLAG, ctypes.byref(value)
-            )
-            return bool(value.value) if rc >= 0 else default
-        if name in ("time-pos", "duration", "volume"):
-            value = c_double()
-            rc = self._lib.mpv_get_property(
-                self._handle, name.encode(), MPV_FORMAT_DOUBLE, ctypes.byref(value)
-            )
-            return value.value if rc >= 0 else default
-        return default
+        # Solo el diccionario que mantiene al día el hilo de eventos: el
+        # hilo de la GUI NUNCA llama a mpv_get_property, porque si mpv
+        # está esperando datos de red esa consulta puede bloquear el
+        # repintado de toda la ventana.
+        with self._props_lock:
+            return self._properties.get(name, default)
 
     def on_property(self, name: str, callback):
         self._prop_callbacks.setdefault(name, []).append(callback)
@@ -578,6 +644,7 @@ class EmbeddedMpvPlayer(QOpenGLWidget):
         self._running = False
         self._pending_url = None
         self._last_eof = False
+        self._reset_playback_properties()
         if self._handle:
             self._command(b"stop")
 
@@ -605,4 +672,17 @@ class EmbeddedMpvPlayer(QOpenGLWidget):
 
 
 def embedded_available() -> bool:
-    return LIBMPV_AVAILABLE and os.environ.get("VISUALES_PLAYER", "").lower() != "external"
+    """Indica si libmpv está disponible para el modo embebido.
+    
+    El embebido pasa a ser *opt-in* por defecto (se prefiere el reproductor
+    externo tipo MVP por estabilidad). Se puede forzar con:
+    - VISUALES_PLAYER=embedded  (activarlo explícitamente)
+    - VISUALES_PLAYER=external  (desactivarlo explícitamente)
+    """
+    mode = os.environ.get("VISUALES_PLAYER", "").lower().strip()
+    if mode == "external":
+        return False
+    if mode == "embedded":
+        return LIBMPV_AVAILABLE
+    # Por defecto: externo. Opt-in únicamente si se pide explícitamente.
+    return False

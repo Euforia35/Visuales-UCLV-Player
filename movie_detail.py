@@ -13,7 +13,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QPixmap, QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-    QFrame, QStackedLayout, QSizePolicy,
+    QFrame, QStackedLayout, QSizePolicy, QComboBox,
 )
 
 import theme
@@ -32,6 +32,7 @@ class MovieDetailView(QWidget):
     show_files_requested = Signal()
     imdb_requested = Signal()
     edit_title_requested = Signal()
+    season_selected = Signal(str)  # URL de la carpeta de la temporada elegida
 
     POSTER_SIZE = (168, 252)         # póster dentro del hero
 
@@ -148,6 +149,26 @@ class MovieDetailView(QWidget):
         body_layout.addWidget(self.synopsis_label)
 
         body_layout.addSpacing(4)
+
+        # Selector de temporadas (estilo Netflix): solo se muestra para
+        # carpetas de series que tienen subcarpetas Temporada/Season.
+        self.season_row = QWidget()
+        season_layout = QHBoxLayout(self.season_row)
+        season_layout.setContentsMargins(0, 0, 0, 0)
+        season_layout.setSpacing(10)
+        season_label = QLabel("Temporada:")
+        season_label.setObjectName("sectionLabel")
+        self.season_combo = QComboBox()
+        self.season_combo.setMinimumWidth(220)
+        self.season_combo.setCursor(Qt.PointingHandCursor)
+        self.season_combo.currentIndexChanged.connect(self._on_season_changed)
+        season_layout.addWidget(season_label)
+        season_layout.addWidget(self.season_combo)
+        season_layout.addStretch(1)
+        self.season_row.hide()
+        body_layout.addWidget(self.season_row)
+        self._seasons: list[tuple[str, str]] = []
+
         self.videos_header = QLabel("CONTENIDO")
         self.videos_header.setObjectName("sectionLabel")
         self.videos_header.hide()
@@ -183,6 +204,7 @@ class MovieDetailView(QWidget):
         self.poster_label.setPixmap(placeholder)
         self.backdrop_label.set_pixmap(None)
         self.set_chips([])
+        self.clear_seasons()
         self._clear_play_buttons()
         self._videos = []
         self.play_hero_btn.hide()
@@ -193,6 +215,51 @@ class MovieDetailView(QWidget):
             w = item.widget()
             if w:
                 w.deleteLater()
+
+    # ------------------------------------------------------------------
+    # Temporadas (series)
+    # ------------------------------------------------------------------
+    def _on_season_changed(self, index: int):
+        if index < 0:
+            return
+        url = self.season_combo.itemData(index)
+        if url:
+            self.season_selected.emit(url)
+
+    def set_seasons(self, seasons: list[tuple[str, str]], current_index: int = 0):
+        """seasons: [(url_carpeta, etiqueta), ...] en orden de temporada."""
+        self._seasons = list(seasons)
+        self.season_combo.blockSignals(True)
+        self.season_combo.clear()
+        for url, label in seasons:
+            self.season_combo.addItem(label, url)
+        if seasons:
+            self.season_combo.setCurrentIndex(
+                max(0, min(current_index, len(seasons) - 1))
+            )
+        self.season_combo.blockSignals(False)
+        self.season_row.setVisible(bool(seasons))
+        self.files_btn.setText(
+            "📁 Ver todos los archivos de la temporada" if seasons
+            else "📁 Ver todos los archivos de la carpeta"
+        )
+
+    def clear_seasons(self):
+        self._seasons = []
+        self.season_combo.blockSignals(True)
+        self.season_combo.clear()
+        self.season_combo.blockSignals(False)
+        self.season_row.hide()
+        self.files_btn.setText("📁 Ver todos los archivos de la carpeta")
+
+    def set_loading_episodes(self, text: str = "Cargando episodios…"):
+        self._videos = []
+        self._clear_play_buttons()
+        self.videos_header.hide()
+        self.play_hero_btn.hide()
+        label = QLabel(text)
+        label.setObjectName("statusLabel")
+        self.play_buttons_layout.addWidget(label)
 
     # ------------------------------------------------------------------
     def set_meta(self, text: str):

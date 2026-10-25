@@ -1,16 +1,19 @@
 """
 player.py
 ---------
-Página de reproducción. Por defecto usa el reproductor **embebido**
-(libmpv dentro de la app, ver ``mpv_embedded.py``): el video se ve en el
-panel central, con los controles debajo.
+Página de reproducción. Por defecto usa el reproductor **externo** (mpv
+como proceso aparte por IPC, ver ``mpv_ipc.py``): abre su propia ventana
+como en la versión MVP, con mayor estabilidad.
 
-Si libmpv no está disponible (o se fuerza con ``VISUALES_PLAYER=external``),
-cae al modo histórico: mpv corre como PROCESO APARTE (ver ``mpv_ipc.py``)
-y abre su propia ventana; este widget solo manda comandos por IPC.
+El modo **embebido** (libmpv dentro de la app, ``mpv_embedded.py``) queda
+como opción experimental y solo se usa si se activa explícitamente con
+``VISUALES_PLAYER=embedded`` o desde preferencias (``use_embedded_player``).
 """
 
 from __future__ import annotations
+
+import os
+import time
 
 from PySide6.QtCore import Qt, QTimer, Signal, QEvent
 from PySide6.QtGui import QShortcut, QKeySequence
@@ -21,6 +24,10 @@ from PySide6.QtWidgets import (
 
 from mpv_ipc import MpvIPCPlayer, find_mpv_binary
 from mpv_embedded import EmbeddedMpvPlayer, embedded_available
+from player_prefs import (
+    DEFAULT_SUB_OUTLINE, MAX_SUB_FONT_SIZE, MIN_SUB_FONT_SIZE, SUB_COLORS,
+    SUB_FONT_STEP, cache_max_mb, cache_secs, sub_color, sub_font_size,
+)
 
 MPV_AVAILABLE = find_mpv_binary() is not None
 EMBEDDED_AVAILABLE = embedded_available()
@@ -38,7 +45,7 @@ def _fmt_time(seconds: float) -> str:
 
 
 class PlayerWidget(QWidget):
-    """Página de reproducción (video embebido o ventana externa de mpv)."""
+    """Página de reproducción (mpv externo por defecto, embebido opcional)."""
 
     error_occurred = Signal(str)
     track_finished = Signal()  # el video llegó al final de verdad (no pausa)
@@ -56,8 +63,9 @@ class PlayerWidget(QWidget):
         "normales de mpv (espacio para pausar, flechas para saltar)."
     )
 
-    def __init__(self, parent=None):
+    def __init__(self, config=None, parent=None):
         super().__init__(parent)
+        self._config = config
         self._duration = 0.0
         self._seeking = False
         self._mpv = None
@@ -68,13 +76,37 @@ class PlayerWidget(QWidget):
         self._eof_callback_registered = False
         self._seek_callback_registered = False
         self._cinema = False
+        self._sub_size = sub_font_size(config)
+        self._sub_color = sub_color(config)
 
-        # Backend embebido por defecto; si algo falla, se usa el externo.
-        self._embedded = EMBEDDED_AVAILABLE
+        # Vigilante de trabas: si el video deja de avanzar (y mpv no está
+        # buffereando ni pausado), intenta destrabarlo solo.
+        self._watch_pos: float | None = None
+        self._watch_since = time.monotonic()
+        self._last_recovery = 0.0
+        self._recover_attempts = 0
+
+        # Por defecto usamos mpv externo (como en el MVP) por estabilidad.
+        # El embebido solo se activa explícitamente con VISUALES_PLAYER=embedded
+        # o con config use_embedded_player=True.
+        use_embedded = False
+        if config is not None:
+            try:
+                use_embedded = bool(config.get("use_embedded_player", False))
+            except Exception:
+                use_embedded = False
+        if not use_embedded:
+            use_embedded = os.environ.get("VISUALES_PLAYER", "").lower().strip() == "embedded"
+
+        self._embedded = bool(use_embedded and EMBEDDED_AVAILABLE)
         self.video: EmbeddedMpvPlayer | None = None
         if self._embedded:
             try:
-                self.video = EmbeddedMpvPlayer(self)
+                self.video = EmbeddedMpvPlayer(
+                    self,
+                    cache_secs=cache_secs(config),
+                    cache_max_mb=cache_max_mb(config),
+                )
                 self.video.error_occurred.connect(self.error_occurred)
                 self.video.track_finished.connect(self.track_finished)
                 self.video.pause_changed.connect(self._on_pause_changed)
@@ -168,6 +200,11 @@ class PlayerWidget(QWidget):
         self.sub_btn = QPushButton("CC")
         self.sub_btn.setCheckable(True)
         self.sub_btn.setChecked(True)
+        self.sub_btn.setToolTip(
+            "Mostrar/ocultar subtítulos\n"
+            "Shift+↑ / Shift+↓ (o + / −): tamaño\n"
+            "C: cambiar color"
+        )
         self.sub_btn.clicked.connect(self._toggle_subs)
 
         self.online_subs_btn = QPushButton("🌐 Subtítulos")
@@ -233,6 +270,20 @@ class PlayerWidget(QWidget):
         self._sc_right = shortcut(Qt.Key_Right, lambda: self.seek_relative(10))
         self._sc_full = shortcut(Qt.Key_F, self._toggle_fullscreen)
         self._sc_esc = shortcut(Qt.Key_Escape, self._exit_fullscreen)
+        # Subtítulos: agrandar/achicar y cambiar de color sin salir del
+        # video. Shift+flechas funciona en cualquier teclado; + y − son
+        # el atajo corto.
+        self._sc_sub_bigger = shortcut(
+            Qt.ShiftModifier | Qt.Key_Up,
+            lambda: self.change_sub_size(SUB_FONT_STEP),
+        )
+        self._sc_sub_smaller = shortcut(
+            Qt.ShiftModifier | Qt.Key_Down,
+            lambda: self.change_sub_size(-SUB_FONT_STEP),
+        )
+        self._sc_sub_bigger_plus = shortcut("+", lambda: self.change_sub_size(SUB_FONT_STEP))
+        self._sc_sub_smaller_minus = shortcut("-", lambda: self.change_sub_size(-SUB_FONT_STEP))
+        self._sc_sub_color = shortcut(Qt.Key_C, self.cycle_sub_color)
 
     # ------------------------------------------------------------------
     # Modo cine (pantalla completa)
@@ -310,7 +361,10 @@ class PlayerWidget(QWidget):
                 "No se encontró el programa 'mpv'. Instalalo con: brew install mpv"
             )
             return False
-        self._mpv = MpvIPCPlayer()
+        self._mpv = MpvIPCPlayer(
+            cache_secs=cache_secs(self._config),
+            cache_max_mb=cache_max_mb(self._config),
+        )
         self._eof_callback_registered = False
         self._seek_callback_registered = False
         return True
@@ -336,6 +390,8 @@ class PlayerWidget(QWidget):
         self._paused = False
         self.play_btn.setText("⏸")
         self._pending_start_at = 0.0
+        self._reset_stall_watch()
+        self._apply_cache_prefs()
 
         if self._embedded and self.video is not None:
             self.stage.setCurrentWidget(self.video)
@@ -354,6 +410,7 @@ class PlayerWidget(QWidget):
                         "Detalle: " + (self.video.last_error() or "desconocido")
                     )
                 return
+            self._apply_sub_prefs()
             if subtitle_urls:
                 for i, sub_url in enumerate(subtitle_urls):
                     self.video.add_subtitle(sub_url, select=(i == 0))
@@ -395,6 +452,7 @@ class PlayerWidget(QWidget):
             self._mpv.on_event("end-file", self._on_end_file)
             self._eof_callback_registered = True
 
+        self._apply_sub_prefs()
         if subtitle_urls:
             for i, sub_url in enumerate(subtitle_urls):
                 self._mpv.add_subtitle(sub_url, select=(i == 0))
@@ -404,9 +462,131 @@ class PlayerWidget(QWidget):
             self._arm_resume_seek()
 
     def _on_embedded_file_loaded(self):
+        self._reset_stall_watch()
         if self._pending_start_at and self._pending_start_at > 1:
             self.video.seek(self._pending_start_at, absolute=True)
             self._pending_start_at = 0.0
+
+    # ------------------------------------------------------------------
+    # Preferencias en caliente (caché y subtítulos)
+    # ------------------------------------------------------------------
+    def _apply_cache_prefs(self):
+        target = self.video if self._embedded else self._mpv
+        if target is None:
+            return
+        target.set_cache_options(
+            cache_secs(self._config), cache_max_mb(self._config)
+        )
+
+    def _apply_sub_prefs(self):
+        if not self._mpv:
+            return
+        try:
+            self._mpv.set_property("sub-font-size", str(self._sub_size))
+            self._mpv.set_property("sub-color", self._sub_color)
+            self._mpv.set_property("sub-outline-color", DEFAULT_SUB_OUTLINE)
+            self._mpv.set_property("sub-outline-size", "3")
+            # Aplica también a subtítulos ASS/SSA (que suelen traer sus
+            # propios estilos y, sin esto, ignoran tamaño y color).
+            self._mpv.set_property("sub-ass-override", "force")
+        except Exception:
+            pass
+
+    def _save_sub_prefs(self):
+        if not self._config:
+            return
+        self._config.set("sub_font_size", self._sub_size)
+        self._config.set("sub_color", self._sub_color)
+
+    def refresh_preferences(self):
+        """Lee de nuevo config.json y aplica los cambios sin reiniciar."""
+        self._sub_size = sub_font_size(self._config)
+        self._sub_color = sub_color(self._config)
+        self._apply_sub_prefs()
+        self._apply_cache_prefs()
+
+    def _osd(self, text: str, duration_ms: int = 1800):
+        if self._mpv:
+            try:
+                self._mpv.show_text(text, duration_ms)
+            except Exception:
+                pass
+
+    def change_sub_size(self, delta: int):
+        new_size = max(
+            MIN_SUB_FONT_SIZE,
+            min(MAX_SUB_FONT_SIZE, self._sub_size + int(delta)),
+        )
+        if new_size == self._sub_size:
+            limite = "máximo" if delta > 0 else "mínimo"
+            self._osd(f"Tamaño de subtítulos: {limite} ({new_size})")
+            return
+        self._sub_size = new_size
+        self._save_sub_prefs()
+        self._apply_sub_prefs()
+        self._osd(f"Subtítulos: {new_size}")
+
+    def cycle_sub_color(self):
+        colores = [hex_value for _name, hex_value in SUB_COLORS]
+        try:
+            index = colores.index(self._sub_color)
+        except ValueError:
+            index = -1
+        index = (index + 1) % len(SUB_COLORS)
+        name, self._sub_color = SUB_COLORS[index]
+        self._save_sub_prefs()
+        self._apply_sub_prefs()
+        self._osd(f"Color de subtítulos: {name}")
+
+    # ------------------------------------------------------------------
+    # Vigilante de trabas
+    # ------------------------------------------------------------------
+    def _reset_stall_watch(self):
+        self._watch_pos = None
+        self._watch_since = time.monotonic()
+        self._last_recovery = 0.0
+        self._recover_attempts = 0
+
+    def _tick_stall_watch(self, pos: float, paused: bool, buffering: bool):
+        now = time.monotonic()
+        # Mientras mpv dice que está buffereando o pausado, es normal que
+        # el tiempo no avance: no lo tratamos como traba.
+        if paused or buffering or not pos:
+            self._watch_pos = pos
+            self._watch_since = now
+            return
+        if self._watch_pos is None or abs(pos - self._watch_pos) > 0.2:
+            self._watch_pos = pos
+            self._watch_since = now
+            self._recover_attempts = 0
+            return
+        if now - self._watch_since < 12 or now - self._last_recovery < 25:
+            return
+        self._last_recovery = now
+        self._watch_since = now
+        self._recover_stall(pos)
+
+    def _recover_stall(self, pos: float):
+        if not (self._mpv and self._mpv.is_running()):
+            return
+        if self.current_url is None:
+            return
+        if self._recover_attempts == 0:
+            # Primer intento: pedir el mismo punto de nuevo suele
+            # destrabar un demuxer que quedó esperando datos.
+            self._osd("Video trabado: reconectando…", 4000)
+            self._mpv.seek(max(0.0, pos), absolute=True)
+            self._recover_attempts = 1
+            return
+        # Segundo intento: recargar el archivo desde la posición actual.
+        self._osd("Reintentando el video desde el mismo punto…", 5000)
+        self._recover_attempts = 0
+        self._pending_start_at = max(0.0, pos)
+        if self._embedded and self.video is not None:
+            self.video.load(self.current_url)
+        else:
+            self._mpv.load(self.current_url, title=self._current_title)
+            self._arm_resume_seek()
 
     def _on_pause_changed(self, value):
         # Si el usuario pausa/reanuda desde el propio video o desde mpv,
@@ -488,6 +668,7 @@ class PlayerWidget(QWidget):
         self.play_btn.setText("⏸")
         self._eof_callback_registered = False
         self._seek_callback_registered = False
+        self._reset_stall_watch()
 
     def seek_relative(self, seconds: float):
         if self._mpv and self._mpv.is_running():
@@ -578,6 +759,13 @@ class PlayerWidget(QWidget):
         self.duration_label.setText(_fmt_time(dur))
         if dur:
             self.seek_slider.setValue(int((pos / dur) * 1000))
+        if dur > 0:
+            finished = bool(self._mpv.get_cached_property("eof-reached", False))
+            self._tick_stall_watch(
+                float(pos),
+                bool(self._mpv.get_cached_property("pause", False)) or finished,
+                bool(self._mpv.get_cached_property("paused-for-cache", False)),
+            )
 
     def shutdown(self):
         self._ui_timer.stop()

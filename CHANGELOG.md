@@ -1,5 +1,35 @@
 # Changelog — Visuales UCLV
 
+## 1.8.1
+- **Caché de video restaurada en el reproductor embebido**: al pasar de
+  mpv externo a libmpv se había quedado a medias. Ahora usa el mismo
+  colchón del MVP (5 min), tope de 150 MB para el demuxer y 75 MB de
+  retroceso, más `cache-pause` para esperar datos en vez de trabarse.
+  Se puede ajustar en **Explorar ▾ → ⚙ Preferencias…** y se aplica en
+  caliente, sin reiniciar la app.
+- **La GUI ya no consulta a libmpv en cada tick**: `time-pos`,
+  `duration`, `pause`, `paused-for-cache`, etc. los mantiene al día el
+  hilo de eventos y la interfaz lee de ahí (igual que el backend
+  externo). Antes, si el hilo de red de mpv estaba esperando al
+  servidor, una consulta desde la GUI podía congelar el repintado.
+- **Vigilante de trabas**: si el tiempo de reproducción deja de avanzar
+  unos 12 s sin que el video esté pausado ni buffereando, la app pide
+  el mismo punto otra vez; si sigue trabado, recarga el video desde esa
+  posición automáticamente.
+- **Subtítulos por teclado**: **Shift+↑ / Shift+↓** (o **+ / −**)
+  agrandan/achican el texto y **C** cambia el color, con aviso en
+  pantalla. Tamaño y color se guardan en `config.json` y también se
+  editan en el nuevo diálogo de **Preferencias**. El estilo se aplica
+  incluso a subtítulos ASS/SSA.
+- **Selector de temporadas estilo Netflix**: al entrar a una carpeta de
+  serie, la ficha muestra un desplegable con las temporadas detectadas
+  (`Temporada 1`, `Season 2`, `S03`, `Series 4`…) y carga los episodios
+  de la elegida sin salir de la ficha. Reconoce los nombres reales del
+  servidor (nombre de la serie incluido, calidad entre corchetes,
+  numerales romanos, `x 3`, etc.) y evita confundir categorías completas
+  con series. Al cerrar un episodio se vuelve a la ficha y a la
+  temporada que estabas viendo.
+
 ## 1.8.0
 - **Reproductor embebido**: el video ahora se reproduce **dentro de la
   ventana de la app** (panel central del reproductor), con los

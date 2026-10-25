@@ -23,6 +23,7 @@ OPTIONS = {
         "lyrics", "config_store", "opensubtitles", "tmdb", "online_dialogs",
         "history_view", "catalog", "sitemap", "search_dialog", "local_subs_dialog",
         "theme", "naming", "cards", "metadata", "home_view", "mpv_embedded",
+        "player_prefs", "preferences_dialog",
     ],
     "plist": {
         "CFBundleName": "Visuales UCLV",

@@ -33,6 +33,8 @@ import threading
 import time
 import uuid
 
+from player_prefs import DEFAULT_CACHE_MAX_MB, DEFAULT_CACHE_SECS
+
 
 def find_mpv_binary() -> str | None:
     """Ubica el EJECUTABLE `mpv` (el programa, no la librería libmpv)."""
@@ -48,8 +50,12 @@ def find_mpv_binary() -> str | None:
 class MpvIPCPlayer:
     """Lanza mpv como proceso aparte y lo controla por su socket IPC."""
 
-    def __init__(self, mpv_path: str | None = None):
+    def __init__(self, mpv_path: str | None = None,
+                 cache_secs: int = DEFAULT_CACHE_SECS,
+                 cache_max_mb: int = DEFAULT_CACHE_MAX_MB):
         self.mpv_path = mpv_path or find_mpv_binary()
+        self.cache_secs = max(30, int(cache_secs))
+        self.cache_max_mb = max(32, int(cache_max_mb))
         self.process: subprocess.Popen | None = None
         self.socket_path = os.path.join(
             tempfile.gettempdir(), f"visualesuclv-mpv-{uuid.uuid4().hex[:8]}.sock"
@@ -104,12 +110,7 @@ class MpvIPCPlayer:
             f"--title={title or 'Visuales UCLV'}",
         ]
         if not _retry_minimal:
-            # Caché/buffer para streaming remoto sobre conexiones lentas o
-            # de latencia alta: sin esto mpv usa su caché por defecto, que
-            # no está pensada para sesiones largas. Si alguno de estos
-            # flags no es compatible con la versión de mpv instalada,
-            # el bloque de abajo lo detecta y reintenta sin ellos —
-            # mejor reproducir sin la optimización que no reproducir nada.
+            # Caché idéntico al MVP 1.6.x
             args += [
                 "--cache=yes",
                 "--demuxer-readahead-secs=300",
@@ -190,8 +191,24 @@ class MpvIPCPlayer:
         self.observe("eof-reached")
         self.observe("path")
         self.observe("pause")
+        self.observe("paused-for-cache")
+        self.observe("core-idle")
         self._cleanup_stderr_log()
         return True
+
+    def _cache_back_mb(self) -> int:
+        return max(32, self.cache_max_mb // 2)
+
+    def set_cache_options(self, cache_secs: int, cache_max_mb: int):
+        """Cambia el búfer sin relanzar mpv (si ya está corriendo)."""
+        self.cache_secs = max(30, int(cache_secs))
+        self.cache_max_mb = max(32, int(cache_max_mb))
+        if not self.is_running():
+            return
+        self.set_property("cache-secs", self.cache_secs)
+        self.set_property("demuxer-readahead-secs", self.cache_secs)
+        self.set_property("demuxer-max-bytes", f"{self.cache_max_mb}MiB")
+        self.set_property("demuxer-max-back-bytes", f"{self._cache_back_mb()}MiB")
 
     def _read_stderr_log(self):
         try:
@@ -374,6 +391,9 @@ class MpvIPCPlayer:
 
     def toggle_fullscreen(self):
         self.command(["cycle", "fullscreen"])
+
+    def show_text(self, text: str, duration_ms: int = 2000):
+        self.command(["show-text", text, int(duration_ms)])
 
     def terminate(self):
         self._stop_reading.set()
